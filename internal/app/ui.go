@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"gioui.org/layout"
+	"gioui.org/op"
 	"gioui.org/op/clip"
 	"gioui.org/op/paint"
 	"gioui.org/text"
@@ -65,53 +66,137 @@ func (a *ChatApp) header(gtx layout.Context) layout.Dimensions {
 func (a *ChatApp) messagesView(gtx layout.Context) layout.Dimensions {
 	a.mu.Lock()
 	msgs := append([]Message(nil), a.messages...)
+	hasOlder := a.hasOlder
 	a.mu.Unlock()
 
 	if len(msgs) == 0 {
 		return centerText(gtx, a.th, "Single conversation. Add text, optionally attach image paths, then send.")
 	}
 
-	return material.List(a.th, &a.scrollList).Layout(gtx, len(msgs), func(gtx layout.Context, i int) layout.Dimensions {
+	count := len(msgs)
+	if hasOlder {
+		count++
+	}
+	return material.List(a.th, &a.scrollList).Layout(gtx, count, func(gtx layout.Context, i int) layout.Dimensions {
+		if hasOlder {
+			if i == 0 {
+				return layout.Inset{Bottom: unit.Dp(12)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+					return layout.Center.Layout(gtx, material.Button(a.th, &a.loadOlderBtn, "Load older").Layout)
+				})
+			}
+			i--
+		}
 		return a.messageBubble(gtx, msgs[i])
 	})
 }
 
 func (a *ChatApp) messageBubble(gtx layout.Context, msg Message) layout.Dimensions {
-	bg := color.NRGBA{R: 255, G: 255, B: 255, A: 238}
-	if msg.Role == "assistant" {
-		bg = color.NRGBA{R: 236, G: 243, B: 255, A: 238}
-	}
+	isUser := msg.Role != "assistant"
 	return layout.Inset{Bottom: unit.Dp(10)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		rr := clip.RRect{Rect: image.Rectangle{Max: gtx.Constraints.Max}, SE: 8, SW: 8, NE: 8, NW: 8}
-		defer rr.Push(gtx.Ops).Pop()
-		paint.Fill(gtx.Ops, bg)
-		return layout.UniformInset(unit.Dp(12)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-			return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					title := material.Body2(a.th, strings.ToUpper(msg.Role))
-					title.Color = rgb(84, 92, 100)
-					return title.Layout(gtx)
-				}),
-				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					body := msg.Text
-					if body == "" {
-						body = "(image only)"
-					}
-					lbl := material.Body1(a.th, body)
-					lbl.Alignment = text.Start
-					return lbl.Layout(gtx)
-				}),
-				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					paths := append([]string{}, msg.Attachments...)
-					paths = append(paths, msg.Images...)
-					if len(paths) == 0 {
-						return layout.Dimensions{}
-					}
-					return a.imageStrip(gtx, paths, unit.Dp(88))
-				}),
-			)
-		})
+		return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Start}.Layout(gtx, messageRowChildren(a, msg, isUser)...)
 	})
+}
+
+func messageRowChildren(a *ChatApp, msg Message, isUser bool) []layout.FlexChild {
+	avatar := layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+		return a.avatar(gtx, msg.Role)
+	})
+	gap := layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+		return layout.Spacer{Width: unit.Dp(8)}.Layout(gtx)
+	})
+	bubble := layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+		maxW := int(float32(gtx.Constraints.Max.X) * 0.68)
+		if maxW < gtx.Dp(unit.Dp(260)) {
+			maxW = gtx.Constraints.Max.X - gtx.Dp(unit.Dp(56))
+		}
+		if maxW > gtx.Dp(unit.Dp(680)) {
+			maxW = gtx.Dp(unit.Dp(680))
+		}
+		if maxW > 0 && gtx.Constraints.Max.X > maxW {
+			gtx.Constraints.Max.X = maxW
+		}
+		return a.bubbleContent(gtx, msg, isUser)
+	})
+	if isUser {
+		return []layout.FlexChild{
+			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+				return layout.Dimensions{Size: image.Pt(gtx.Constraints.Max.X, 1)}
+			}),
+			bubble,
+			gap,
+			avatar,
+		}
+	}
+	return []layout.FlexChild{
+		avatar,
+		gap,
+		bubble,
+		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+			return layout.Dimensions{Size: image.Pt(gtx.Constraints.Max.X, 1)}
+		}),
+	}
+}
+
+func (a *ChatApp) bubbleContent(gtx layout.Context, msg Message, isUser bool) layout.Dimensions {
+	bg := color.NRGBA{R: 255, G: 255, B: 255, A: 255}
+	if isUser {
+		bg = color.NRGBA{R: 218, G: 246, B: 214, A: 255}
+	}
+	macro := op.Record(gtx.Ops)
+	dims := layout.UniformInset(unit.Dp(10)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				meta := strings.ToUpper(msg.Role)
+				if !msg.CreatedAt.IsZero() {
+					meta += "  " + msg.CreatedAt.Format("15:04")
+				}
+				title := material.Body2(a.th, meta)
+				title.Color = rgb(92, 100, 108)
+				return title.Layout(gtx)
+			}),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				body := msg.Text
+				if body == "" {
+					body = "(image only)"
+				}
+				lbl := material.Body1(a.th, body)
+				lbl.Alignment = text.Start
+				return lbl.Layout(gtx)
+			}),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				paths := append([]string{}, msg.Attachments...)
+				paths = append(paths, msg.Images...)
+				if len(paths) == 0 {
+					return layout.Dimensions{}
+				}
+				return a.imageStrip(gtx, paths, unit.Dp(72))
+			}),
+		)
+	})
+	call := macro.Stop()
+	rr := clip.RRect{Rect: image.Rectangle{Max: dims.Size}, SE: 10, SW: 10, NE: 10, NW: 10}
+	defer rr.Push(gtx.Ops).Pop()
+	paint.Fill(gtx.Ops, bg)
+	call.Add(gtx.Ops)
+	return dims
+}
+
+func (a *ChatApp) avatar(gtx layout.Context, role string) layout.Dimensions {
+	size := gtx.Dp(unit.Dp(34))
+	gtx.Constraints.Min = image.Pt(size, size)
+	gtx.Constraints.Max = image.Pt(size, size)
+	bg := rgb(102, 121, 245)
+	label := "A"
+	if role != "assistant" {
+		bg = rgb(34, 150, 82)
+		label = "U"
+	}
+	defer clip.Ellipse{Max: image.Pt(size, size)}.Push(gtx.Ops).Pop()
+	paint.Fill(gtx.Ops, bg)
+	txt := material.Body1(a.th, label)
+	txt.Color = color.NRGBA{R: 255, G: 255, B: 255, A: 255}
+	txt.Alignment = text.Middle
+	return layout.Center.Layout(gtx, txt.Layout)
 }
 
 func (a *ChatApp) imageStrip(gtx layout.Context, paths []string, sizeDp unit.Dp) layout.Dimensions {

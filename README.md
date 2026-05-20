@@ -10,7 +10,9 @@ Eibanban is a minimal native desktop chat app built with Go and Gio. It talks to
 - Image attachment upload, including SVG conversion and transparent-image white background preparation
 - Click-to-preview images with zoom controls and panning
 - Persistent conversation history in SQLite
-- Fixed context injection from `character.md` and `memories.md`
+- Prompt engineering context assembly from character prompt, long-term memory recall, short-term summary, recent messages, role state, user profile/context, environment context, and function schemas
+- Extensible local orchestrator for model-requested function calls
+- Sliding-window message loading for large local histories
 - Reads Codex-style config from `~/.codex/config.toml` and `~/.codex/auth.json`
 
 ## Project Layout
@@ -18,6 +20,7 @@ Eibanban is a minimal native desktop chat app built with Go and Gio. It talks to
 ```text
 cmd/eibanban/        Application entrypoint
 internal/app/        Gio UI, API client, storage, image handling, and app logic
+plan/                Product requirements, architecture, and development plan
 character.md         Character prompt injected into every request
 memories.md          Memory document injected into every request
 ```
@@ -63,6 +66,8 @@ Conversation history is stored in SQLite:
 ~/Library/Application Support/chengcheng-chat/chat.db
 ```
 
+The database also stores long-term memories, short-term summaries, role state, user profile/context, environment state, prompt snapshots, tool calls, and orchestrator events.
+
 Generated and prepared images are written under:
 
 ```text
@@ -77,6 +82,14 @@ Run all checks:
 
 ```bash
 go test ./...
+```
+
+The upgrade plan is documented in:
+
+```text
+plan/product_requirements.md
+plan/technical_architecture.md
+plan/development_plan.md
 ```
 
 ## License

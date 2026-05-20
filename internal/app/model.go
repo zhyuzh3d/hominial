@@ -15,11 +15,120 @@ type Config struct {
 type Message struct {
 	ID          string
 	ThreadID    string
+	Seq         int
 	Role        string
 	Text        string
 	Images      []string
 	CreatedAt   time.Time
 	Attachments []string
+	ToolCalls   []ToolCall
+}
+
+type ToolCall struct {
+	ID        string
+	Name      string
+	Arguments string
+	Status    string
+	Result    string
+}
+
+type PEConfig struct {
+	LongMemoryTopN        int
+	LongMemoryRandomM     int
+	RecentMessagesK       int
+	MessageWindowSize     int
+	MaxPromptChars        int
+	MaxRoleChars          int
+	MaxSectionChars       int
+	SummaryRefreshEvery   int
+	ReferenceImageTimeout time.Duration
+}
+
+type LongTermMemory struct {
+	ID             string
+	Content        string
+	Rank           int
+	RecallCount    int
+	LastRecalledAt time.Time
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
+type ShortTermSummary struct {
+	ThreadID       string
+	Content        string
+	UpToSeq        int
+	SourceMessages int
+	UpdatedAt      time.Time
+}
+
+type RoleState struct {
+	Health                string
+	Mental                string
+	Mood                  string
+	Action                string
+	ShortPurpose          string
+	ShortGoalCloseness    int
+	ShortGoalDeviation    int
+	LongGoalCloseness     int
+	LongGoalDeviation     int
+	BehaviorEffectiveness int
+	ControlScore          int
+	MetadataJSON          string
+	UpdatedAt             time.Time
+}
+
+type UserProfile struct {
+	UserID        string
+	SetJSON       string
+	EstimatedJSON string
+	UpdatedAt     time.Time
+}
+
+type UserContext struct {
+	UserID               string
+	Mood                 string
+	Action               string
+	Environment          string
+	NextActionPrediction string
+	LastPrediction       string
+	EvaluationJSON       string
+	UpdatedAt            time.Time
+}
+
+type EnvironmentState struct {
+	ThreadID     string
+	Scene        string
+	Surroundings string
+	RandomSeed   int64
+	MetadataJSON string
+	UpdatedAt    time.Time
+}
+
+type PromptContext struct {
+	Config      PEConfig
+	RolePrompt  string
+	Memories    []LongTermMemory
+	Summary     ShortTermSummary
+	Recent      []Message
+	RoleState   RoleState
+	UserProfile UserProfile
+	UserContext UserContext
+	Environment EnvironmentState
+	Now         time.Time
+}
+
+type PromptEnvelope struct {
+	Input        []map[string]any
+	Tools        []map[string]any
+	WantsImage   bool
+	SystemPrompt string
+	SectionSizes map[string]int
+}
+
+type APIResult struct {
+	Message   Message
+	ToolCalls []ToolCall
 }
 
 type previewState struct {
@@ -39,7 +148,8 @@ type historyStore struct {
 }
 
 const (
-	defaultUserID   = "local-user"
-	defaultAgentID  = "assistant"
-	defaultThreadID = "default-thread"
+	defaultUserID     = "local-user"
+	defaultAgentID    = "assistant"
+	defaultThreadID   = "default-thread"
+	defaultWindowSize = 240
 )

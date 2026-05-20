@@ -25,20 +25,21 @@ type ChatApp struct {
 
 	cfg Config
 
-	input       widget.Editor
-	imagePath   widget.Editor
-	baseURL     widget.Editor
-	model       widget.Editor
-	sendBtn     widget.Clickable
-	addImgBtn   widget.Clickable
-	clearBtn    widget.Clickable
-	clearImgBtn widget.Clickable
-	closeBtn    widget.Clickable
-	zoomInBtn   widget.Clickable
-	zoomOutBtn  widget.Clickable
-	actualBtn   widget.Clickable
-	fitBtn      widget.Clickable
-	scrollList  widget.List
+	input        widget.Editor
+	imagePath    widget.Editor
+	baseURL      widget.Editor
+	model        widget.Editor
+	sendBtn      widget.Clickable
+	addImgBtn    widget.Clickable
+	clearBtn     widget.Clickable
+	loadOlderBtn widget.Clickable
+	clearImgBtn  widget.Clickable
+	closeBtn     widget.Clickable
+	zoomInBtn    widget.Clickable
+	zoomOutBtn   widget.Clickable
+	actualBtn    widget.Clickable
+	fitBtn       widget.Clickable
+	scrollList   widget.List
 
 	mu            sync.Mutex
 	messages      []Message
@@ -47,6 +48,8 @@ type ChatApp struct {
 	loading       bool
 	enlarged      string
 	historyPath   string
+	peConfig      PEConfig
+	hasOlder      bool
 	preview       previewState
 	imgCache      map[string]image.Image
 	imgOps        map[string]paint.ImageOp
@@ -73,6 +76,7 @@ func NewChatApp(w *gioapp.Window) *ChatApp {
 		th:            material.NewTheme(),
 		cfg:           cfg,
 		historyPath:   historyPath(),
+		peConfig:      defaultPEConfig(),
 		imgCache:      make(map[string]image.Image),
 		imgOps:        make(map[string]paint.ImageOp),
 		imageButtons:  make(map[string]*widget.Clickable),
@@ -87,8 +91,9 @@ func NewChatApp(w *gioapp.Window) *ChatApp {
 		a.status = "History DB error: " + err.Error()
 	} else if err := migrateJSONHistory(a.historyPath); err != nil {
 		a.status = "History migration warning: " + err.Error()
-	} else if msgs, err := loadHistory(a.historyPath); err == nil && len(msgs) > 0 {
+	} else if msgs, hasOlder, err := loadRecentMessages(a.historyPath, defaultThreadID, a.peConfig.MessageWindowSize); err == nil && len(msgs) > 0 {
 		a.messages = msgs
+		a.hasOlder = hasOlder
 		a.status = fmt.Sprintf("Restored %d message(s)", len(msgs))
 	}
 	a.input.SingleLine = false
@@ -152,10 +157,14 @@ func (a *ChatApp) handleEvents(gtx layout.Context) {
 		a.pendingImgs = nil
 		a.enlarged = ""
 		a.preview = previewState{}
+		a.hasOlder = false
 		a.status = "Conversation cleared"
 		a.mu.Unlock()
 		a.saveHistoryAllowEmpty()
 		a.win.Invalidate()
+	}
+	for a.loadOlderBtn.Clicked(gtx) {
+		a.loadOlderMessages()
 	}
 	for a.clearImgBtn.Clicked(gtx) {
 		a.mu.Lock()
@@ -204,29 +213,81 @@ func (a *ChatApp) send() {
 	a.input.SetText("")
 	a.imagePath.SetText("")
 	a.pendingImgs = nil
-	a.messages = append(a.messages, Message{Role: "user", Text: text, Attachments: imgs, CreatedAt: time.Now()})
+	userMsg := Message{Role: "user", Text: text, Attachments: imgs, CreatedAt: time.Now()}
+	if err := saveMessageDB(a.historyPath, &userMsg); err != nil {
+		a.status = "History save failed: " + err.Error()
+		a.mu.Unlock()
+		a.win.Invalidate()
+		return
+	}
+	a.messages = append(a.messages, userMsg)
 	a.loading = true
 	a.status = "Sending..."
-	snapshot := append([]Message(nil), a.messages...)
 	cfg := a.cfg
+	historyPath := a.historyPath
+	peCfg := a.peConfig
 	a.mu.Unlock()
-	a.saveHistory()
 	a.win.Invalidate()
 
 	go func() {
-		reply, err := callResponses(context.Background(), cfg, snapshot)
+		result, err := callResponses(context.Background(), cfg, historyPath, peCfg)
 		a.mu.Lock()
-		defer a.mu.Unlock()
 		a.loading = false
 		if err != nil {
 			a.status = "Error: " + err.Error()
+			a.mu.Unlock()
 		} else {
+			reply := result.Message
+			if err := saveMessageDB(historyPath, &reply); err != nil {
+				a.status = "History save failed: " + err.Error()
+				a.mu.Unlock()
+				a.win.Invalidate()
+				return
+			}
 			a.messages = append(a.messages, reply)
 			a.status = "Ready"
+			a.mu.Unlock()
+			generated, orchErr := runOrchestrator(context.Background(), historyPath, cfg, reply.ID, result.ToolCalls)
+			a.mu.Lock()
+			for i := range generated {
+				if err := saveMessageDB(historyPath, &generated[i]); err == nil {
+					a.messages = append(a.messages, generated[i])
+				}
+			}
+			if orchErr != nil {
+				a.status = "Tool warning: " + orchErr.Error()
+			}
+			a.mu.Unlock()
+			if err := maybeRefreshShortSummary(context.Background(), cfg, historyPath, peCfg); err != nil {
+				a.setStatus("Summary warning: " + err.Error())
+			}
 		}
-		a.saveHistoryLocked(false)
 		a.win.Invalidate()
 	}()
+}
+
+func (a *ChatApp) loadOlderMessages() {
+	a.mu.Lock()
+	if len(a.messages) == 0 || !a.hasOlder {
+		a.mu.Unlock()
+		return
+	}
+	beforeSeq := a.messages[0].Seq
+	a.mu.Unlock()
+	msgs, hasOlder, err := loadOlderMessages(a.historyPath, defaultThreadID, beforeSeq, a.peConfig.MessageWindowSize)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err != nil {
+		a.status = "Load older failed: " + err.Error()
+	} else if len(msgs) == 0 {
+		a.hasOlder = false
+		a.status = "No older messages"
+	} else {
+		a.messages = append(msgs, a.messages...)
+		a.hasOlder = hasOlder
+		a.status = fmt.Sprintf("Loaded %d older message(s)", len(msgs))
+	}
+	a.win.Invalidate()
 }
 
 func (a *ChatApp) setStatus(s string) {

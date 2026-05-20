@@ -18,27 +18,29 @@ import (
 	"time"
 )
 
-func callResponses(ctx context.Context, cfg Config, history []Message) (Message, error) {
+func callResponses(ctx context.Context, cfg Config, historyPath string, peCfg PEConfig) (APIResult, error) {
 	if cfg.APIKey == "" {
-		return Message{}, errors.New("missing OPENAI_API_KEY in ~/.codex/auth.json or environment")
+		return APIResult{}, errors.New("missing OPENAI_API_KEY in ~/.codex/auth.json or environment")
 	}
 	if cfg.BaseURL == "" || cfg.Model == "" {
-		return Message{}, errors.New("base URL and model are required")
+		return APIResult{}, errors.New("base URL and model are required")
 	}
 
-	input, err := buildInput(history)
+	promptCtx, err := loadPromptContext(historyPath, peCfg)
 	if err != nil {
-		return Message{}, err
+		return APIResult{}, err
+	}
+	envelope, err := buildPrompt(promptCtx)
+	if err != nil {
+		return APIResult{}, err
 	}
 	body := map[string]any{
 		"model":  cfg.Model,
-		"input":  input,
+		"input":  envelope.Input,
 		"stream": true,
-		"tools": []map[string]any{
-			{"type": "image_generation"},
-		},
+		"tools":  envelope.Tools,
 	}
-	if wantsImage(history) {
+	if envelope.WantsImage {
 		body["tool_choice"] = map[string]any{"type": "image_generation"}
 	}
 	data, _ := json.Marshal(body)
@@ -51,7 +53,7 @@ func callResponses(ctx context.Context, cfg Config, history []Message) (Message,
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
 	if err != nil {
-		return Message{}, err
+		return APIResult{}, err
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 	req.Header.Set("Content-Type", "application/json")
@@ -59,77 +61,87 @@ func callResponses(ctx context.Context, cfg Config, history []Message) (Message,
 	client := &http.Client{Timeout: 10 * time.Minute}
 	resp, err := client.Do(req)
 	if err != nil {
-		return Message{}, err
+		return APIResult{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		raw, _ := io.ReadAll(resp.Body)
-		return Message{}, fmt.Errorf("api %s: %s", resp.Status, trimForStatus(raw))
+		return APIResult{}, fmt.Errorf("api %s: %s", resp.Status, trimForStatus(raw))
 	}
 
-	text, images, err := parseResponseStream(resp.Body)
+	text, images, calls, err := parseResponseStream(resp.Body)
+	if err != nil {
+		return APIResult{}, err
+	}
+	message := Message{Role: "assistant", Text: text, Images: images, CreatedAt: time.Now(), ToolCalls: calls}
+	savePromptSnapshot(historyPath, "", envelope)
+	return APIResult{Message: message, ToolCalls: calls}, nil
+}
+
+func callReferenceImage(ctx context.Context, cfg Config, prompt string, refs []string) (Message, error) {
+	if cfg.APIKey == "" {
+		return Message{}, errors.New("missing OPENAI_API_KEY in ~/.codex/auth.json or environment")
+	}
+	parts := []map[string]any{{"type": "input_text", "text": prompt}}
+	for _, ref := range refs {
+		dataURL, err := fileDataURL(ref)
+		if err != nil {
+			return Message{}, err
+		}
+		parts = append(parts, map[string]any{"type": "input_image", "image_url": dataURL})
+	}
+	body := map[string]any{
+		"model":       cfg.Model,
+		"input":       []map[string]any{{"role": "user", "content": parts}},
+		"stream":      true,
+		"tools":       []map[string]any{{"type": "image_generation"}},
+		"tool_choice": map[string]any{"type": "image_generation"},
+	}
+	data, _ := json.Marshal(body)
+	url := strings.TrimRight(cfg.BaseURL, "/")
+	if !strings.HasSuffix(url, "/v1") {
+		url += "/v1"
+	}
+	url += "/responses"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
 	if err != nil {
 		return Message{}, err
 	}
-	return Message{Role: "assistant", Text: text, Images: images, CreatedAt: time.Now()}, nil
+	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 10 * time.Minute}).Do(req)
+	if err != nil {
+		return Message{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		raw, _ := io.ReadAll(resp.Body)
+		return Message{}, fmt.Errorf("api %s: %s", resp.Status, trimForStatus(raw))
+	}
+	text, images, _, err := parseResponseStream(resp.Body)
+	if err != nil {
+		return Message{}, err
+	}
+	return Message{Role: "assistant", Text: strings.TrimSpace(text), Images: images, CreatedAt: time.Now()}, nil
 }
 
-func buildInput(history []Message) ([]map[string]any, error) {
-	mem, _ := os.ReadFile("memories.md")
-	char, _ := os.ReadFile("character.md")
-	systemText := strings.TrimSpace("# character.md\n" + string(char) + "\n\n# memories.md\n" + string(mem))
-	input := []map[string]any{{
-		"role": "system",
-		"content": []map[string]any{{
-			"type": "input_text",
-			"text": systemText,
-		}},
-	}}
-	start := 0
-	if len(history) > 20 {
-		start = len(history) - 20
-	}
-	for _, m := range history[start:] {
-		role := m.Role
-		if role != "assistant" {
-			role = "user"
-		}
-		parts := []map[string]any{}
-		if strings.TrimSpace(m.Text) != "" {
-			typ := "input_text"
-			if role == "assistant" {
-				typ = "output_text"
-			}
-			parts = append(parts, map[string]any{"type": typ, "text": m.Text})
-		}
-		for _, img := range m.Attachments {
-			dataURL, err := fileDataURL(img)
-			if err != nil {
-				return nil, err
-			}
-			parts = append(parts, map[string]any{"type": "input_image", "image_url": dataURL})
-		}
-		if len(parts) == 0 {
-			continue
-		}
-		input = append(input, map[string]any{"role": role, "content": parts})
-	}
-	return input, nil
-}
-
-func parseResponse(raw []byte) (string, []string, error) {
+func parseResponse(raw []byte) (string, []string, []ToolCall, error) {
 	var root any
 	if err := json.Unmarshal(raw, &root); err != nil {
-		return "", nil, err
+		return "", nil, nil, err
 	}
 	var texts []string
 	var images []string
+	var calls []ToolCall
 	walkJSON(root, func(m map[string]any) {
 		if t, _ := m["type"].(string); t == "output_text" || t == "text" {
 			if s, _ := m["text"].(string); s != "" {
 				texts = append(texts, s)
 			}
+		}
+		if call := parseToolCallMap(m); call.Name != "" {
+			calls = append(calls, call)
 		}
 		for _, key := range []string{"result", "b64_json", "image_base64"} {
 			if s, _ := m[key].(string); looksBase64Image(s) {
@@ -151,15 +163,16 @@ func parseResponse(raw []byte) (string, []string, error) {
 			texts = append(texts, s)
 		}
 	}
-	return strings.TrimSpace(strings.Join(texts, "\n\n")), dedupeStrings(images), nil
+	return strings.TrimSpace(strings.Join(texts, "\n\n")), dedupeStrings(images), dedupeToolCalls(calls), nil
 }
 
-func parseResponseStream(r io.Reader) (string, []string, error) {
+func parseResponseStream(r io.Reader) (string, []string, []ToolCall, error) {
 	br := bufio.NewReaderSize(r, 1024*1024)
 	var eventName string
 	var data strings.Builder
 	var lastText string
 	var lastImages []string
+	var lastCalls []ToolCall
 	var sawCompleted bool
 
 	flush := func() error {
@@ -187,7 +200,7 @@ func parseResponseStream(r io.Reader) (string, []string, error) {
 		}
 
 		if typ == "response.output_item.done" || typ == "response.completed" {
-			text, images, err := parseResponse([]byte(payload))
+			text, images, calls, err := parseResponse([]byte(payload))
 			if err == nil {
 				if text != "" {
 					lastText = text
@@ -195,19 +208,25 @@ func parseResponseStream(r io.Reader) (string, []string, error) {
 				if len(images) > 0 {
 					lastImages = append(lastImages, images...)
 				}
+				if len(calls) > 0 {
+					lastCalls = append(lastCalls, calls...)
+				}
 			}
 		}
 		if typ == "response.completed" {
 			sawCompleted = true
 			if response, ok := evt["response"]; ok {
 				raw, _ := json.Marshal(response)
-				text, images, err := parseResponse(raw)
+				text, images, calls, err := parseResponse(raw)
 				if err == nil {
 					if text != "" {
 						lastText = text
 					}
 					if len(images) > 0 {
 						lastImages = append(lastImages, images...)
+					}
+					if len(calls) > 0 {
+						lastCalls = append(lastCalls, calls...)
 					}
 				}
 			}
@@ -223,7 +242,7 @@ func parseResponseStream(r io.Reader) (string, []string, error) {
 			switch {
 			case line == "":
 				if err := flush(); err != nil {
-					return "", nil, err
+					return "", nil, nil, err
 				}
 			case strings.HasPrefix(line, "event:"):
 				eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
@@ -238,19 +257,19 @@ func parseResponseStream(r io.Reader) (string, []string, error) {
 			if errors.Is(err, io.EOF) {
 				if data.Len() > 0 {
 					if err := flush(); err != nil {
-						return "", nil, err
+						return "", nil, nil, err
 					}
 				}
 				break
 			}
-			return "", nil, err
+			return "", nil, nil, err
 		}
 	}
 
-	if !sawCompleted && lastText == "" && len(lastImages) == 0 {
-		return "", nil, errors.New("stream ended without a completed response")
+	if !sawCompleted && lastText == "" && len(lastImages) == 0 && len(lastCalls) == 0 {
+		return "", nil, nil, errors.New("stream ended without a completed response")
 	}
-	return lastText, dedupeStrings(lastImages), nil
+	return lastText, dedupeStrings(lastImages), dedupeToolCalls(lastCalls), nil
 }
 
 func walkJSON(v any, fn func(map[string]any)) {
