@@ -10,9 +10,9 @@
 ## Phase 2: Prompt Engineering Foundation
 
 - Add PE data types and default config.
-- Extend SQLite schema for memories, summaries, role state, user profile/context, environment state, function events, and prompt snapshots.
+- Extend SQLite schema for memories, summarizations, role state, user profile/context, environment state, function events, and prompt snapshots.
 - Seed long-term memories from `memories.md` when the memory table is empty.
-- Build the system prompt from role, memory recall, summary, state, user, environment, and function guidance.
+- Build the system prompt from role, memory recall, summarize, state, user, environment, and function guidance.
 
 ## Phase 3: Orchestrator
 

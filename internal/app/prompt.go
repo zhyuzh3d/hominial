@@ -14,7 +14,8 @@ func buildPrompt(ctx PromptContext) (PromptEnvelope, error) {
 	sections := map[string]string{}
 	sections["role"] = trimRunes(strings.TrimSpace(ctx.RolePrompt), cfg.MaxRoleChars)
 	sections["memory"] = formatMemories(ctx.Memories, cfg.MaxSectionChars)
-	sections["summary"] = trimRunes(ctx.Summary.Content, cfg.MaxSectionChars)
+	sections["memory_index"] = trimRunes(ctx.MemoryIndex, cfg.MaxSectionChars/2)
+	sections["summarization"] = trimRunes(ctx.Summarization.Content, cfg.MaxSectionChars)
 	sections["role_context"] = formatRoleContext(ctx.RoleState)
 	sections["user_profile"] = formatUserProfile(ctx.UserProfile)
 	sections["user_context"] = formatUserContext(ctx.UserContext)
@@ -85,8 +86,9 @@ func composeSystemPrompt(sections map[string]string, maxChars int) string {
 		title string
 	}{
 		{"role", "Role Setting"},
+		{"memory_index", "Memory Categories And Tags"},
 		{"memory", "Long-Term Memory Recall"},
-		{"summary", "Short-Term Memory Summary"},
+		{"summarization", "Short-Term Memory Summarization"},
 		{"role_context", "Role Context"},
 		{"user_profile", "User Profile"},
 		{"user_context", "User Context"},
@@ -112,7 +114,16 @@ func formatMemories(memories []LongTermMemory, maxChars int) string {
 	}
 	var b strings.Builder
 	for _, m := range memories {
-		fmt.Fprintf(&b, "- rank=%d recall_count=%d id=%s: %s\n", m.Rank, m.RecallCount, m.ID, strings.TrimSpace(m.Content))
+		id := m.ID
+		if m.ModelID > 0 {
+			id = fmt.Sprintf("M%d", m.ModelID)
+		}
+		category := emptyDefault(m.Category, "uncategorized")
+		tags := strings.TrimSpace(m.TagsJSON)
+		if tags == "" || tags == "null" {
+			tags = "[]"
+		}
+		fmt.Fprintf(&b, "- id=%s category=%s tags=%s rank=%d confidence=%d recalled=%d used=%d: %s\n", id, category, tags, m.Rank, m.Confidence, m.RecalledCount, m.UsedCount, strings.TrimSpace(m.Content))
 	}
 	return trimRunes(b.String(), maxChars)
 }
@@ -156,7 +167,7 @@ metadata=%s`, now.Format("2006-01-02 15:04:05 MST"), now.Weekday().String(), emp
 }
 
 func functionPolicyText() string {
-	return `Available functions can update long-term memory, role state, user profile, user context, environment, and request reference-image generation. Use them as private state actions. When updating scores, use 0-100 integers. Compare your previous prediction against the user's actual reply before updating control_score and behavior_effectiveness.`
+	return `Use only the model-visible tools when you need actions. Prefer compact unified tools: db, memory, query, sendmsg, selfie, notify, schedule, summarize, dream, and meditate. A callback is another tool call; use callback.tool="sendmsg" to send a tool result to the user, to yourself for continuation, or to the internal event stream. user_set_profile is read-only; write only your own estimated user profile. Memory IDs are shown as M<number>. Mark a memory as used only when you actually relied on it in this reply; recalled memories are not automatically used. When updating scores, use 0-100 integers. Compare your previous prediction against the user's actual reply before updating control_score and behavior_effectiveness.`
 }
 
 func trimRunes(s string, max int) string {

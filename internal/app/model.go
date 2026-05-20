@@ -32,6 +32,22 @@ type ToolCall struct {
 	Result    string
 }
 
+type ToolCallback struct {
+	Tool string         `json:"tool"`
+	Args map[string]any `json:"args,omitempty"`
+}
+
+type ToolContinuation struct {
+	SourceCallID string
+	Text         string
+	Payload      map[string]any
+}
+
+type OrchestratorResult struct {
+	Messages      []Message
+	Continuations []ToolContinuation
+}
+
 type PEConfig struct {
 	LongMemoryTopN        int
 	LongMemoryRandomM     int
@@ -40,21 +56,30 @@ type PEConfig struct {
 	MaxPromptChars        int
 	MaxRoleChars          int
 	MaxSectionChars       int
-	SummaryRefreshEvery   int
+	SummarizeEvery        int
 	ReferenceImageTimeout time.Duration
 }
 
 type LongTermMemory struct {
-	ID             string
-	Content        string
-	Rank           int
-	RecallCount    int
-	LastRecalledAt time.Time
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	ID              string
+	ModelID         int
+	Content         string
+	Category        string
+	TagsJSON        string
+	Rank            int
+	Confidence      int
+	RecallCount     int
+	RecalledCount   int
+	UsedCount       int
+	LastRecalledAt  time.Time
+	LastUsedAt      time.Time
+	SourceMessageID string
+	Status          string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
-type ShortTermSummary struct {
+type ShortTermSummarization struct {
 	ThreadID       string
 	Content        string
 	UpToSeq        int
@@ -106,16 +131,17 @@ type EnvironmentState struct {
 }
 
 type PromptContext struct {
-	Config      PEConfig
-	RolePrompt  string
-	Memories    []LongTermMemory
-	Summary     ShortTermSummary
-	Recent      []Message
-	RoleState   RoleState
-	UserProfile UserProfile
-	UserContext UserContext
-	Environment EnvironmentState
-	Now         time.Time
+	Config        PEConfig
+	RolePrompt    string
+	Memories      []LongTermMemory
+	MemoryIndex   string
+	Summarization ShortTermSummarization
+	Recent        []Message
+	RoleState     RoleState
+	UserProfile   UserProfile
+	UserContext   UserContext
+	Environment   EnvironmentState
+	Now           time.Time
 }
 
 type PromptEnvelope struct {

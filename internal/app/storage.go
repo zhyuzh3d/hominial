@@ -9,6 +9,7 @@ import (
 	"mime"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -297,13 +298,22 @@ func initHistoryDB(path string) error {
 		)`,
 		`CREATE TABLE IF NOT EXISTS long_term_memories (
 			id TEXT PRIMARY KEY,
+			model_id INTEGER,
 			agent_id TEXT NOT NULL,
 			user_id TEXT,
 			content TEXT NOT NULL,
+			category TEXT NOT NULL DEFAULT '',
+			tags_json TEXT NOT NULL DEFAULT '[]',
 			rank INTEGER NOT NULL DEFAULT 1,
+			confidence INTEGER NOT NULL DEFAULT 70,
 			recall_count INTEGER NOT NULL DEFAULT 0,
+			recalled_count INTEGER NOT NULL DEFAULT 0,
+			used_count INTEGER NOT NULL DEFAULT 0,
 			last_recalled_at TEXT,
+			last_used_at TEXT,
 			source TEXT NOT NULL DEFAULT 'manual',
+			source_message_id TEXT,
+			status TEXT NOT NULL DEFAULT 'active',
 			metadata_json TEXT NOT NULL DEFAULT '{}',
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
@@ -312,7 +322,9 @@ func initHistoryDB(path string) error {
 			FOREIGN KEY(user_id) REFERENCES users(id)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_ltm_agent_score ON long_term_memories(agent_id, rank, recall_count, updated_at)`,
-		`CREATE TABLE IF NOT EXISTS short_term_summaries (
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_ltm_model_id ON long_term_memories(model_id) WHERE model_id IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_ltm_category ON long_term_memories(agent_id, category, status)`,
+		`CREATE TABLE IF NOT EXISTS short_term_summarizations (
 			thread_id TEXT PRIMARY KEY,
 			content TEXT NOT NULL DEFAULT '',
 			up_to_seq INTEGER NOT NULL DEFAULT 0,
@@ -378,6 +390,21 @@ func initHistoryDB(path string) error {
 			FOREIGN KEY(thread_id) REFERENCES threads(id),
 			FOREIGN KEY(message_id) REFERENCES messages(id)
 		)`,
+		`CREATE TABLE IF NOT EXISTS scheduled_tool_calls (
+			id TEXT PRIMARY KEY,
+			owner TEXT NOT NULL DEFAULT 'ai',
+			name TEXT NOT NULL,
+			tool_name TEXT NOT NULL,
+			arguments_json TEXT NOT NULL DEFAULT '{}',
+			callback_json TEXT NOT NULL DEFAULT '{}',
+			run_at TEXT,
+			interval_seconds INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL DEFAULT 'active',
+			last_run_at TEXT,
+			next_run_at TEXT,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS prompt_snapshots (
 			id TEXT PRIMARY KEY,
 			thread_id TEXT NOT NULL,
@@ -393,6 +420,9 @@ func initHistoryDB(path string) error {
 		if _, err := db.Exec(stmt); err != nil {
 			return err
 		}
+	}
+	if err := migrateUnifiedToolColumns(db); err != nil {
+		return err
 	}
 	now := time.Now().Format(time.RFC3339Nano)
 	if _, err := db.Exec(`INSERT OR IGNORE INTO users(id, display_name, created_at) VALUES(?, ?, ?)`, defaultUserID, "Local User", now); err != nil {
@@ -416,6 +446,12 @@ func initHistoryDB(path string) error {
 	if _, err := db.Exec(`INSERT OR IGNORE INTO environment_states(thread_id, random_seed, updated_at) VALUES(?, ?, ?)`, defaultThreadID, time.Now().UnixNano(), now); err != nil {
 		return err
 	}
+	if err := migrateTerminology(db); err != nil {
+		return err
+	}
+	if err := seedDefaultScheduledTools(db); err != nil {
+		return err
+	}
 	_, err = db.Exec(`
 		WITH ordered AS (
 			SELECT id, ROW_NUMBER() OVER (ORDER BY created_at, id) AS rn
@@ -427,6 +463,171 @@ func initHistoryDB(path string) error {
 		WHERE id IN (SELECT id FROM ordered)
 	`, defaultThreadID)
 	return err
+}
+
+func seedDefaultScheduledTools(db *sql.DB) error {
+	now := time.Now()
+	defaults := []struct {
+		id       string
+		name     string
+		tool     string
+		args     string
+		interval int
+		next     time.Time
+	}{
+		{
+			id:       "default_dream_hourly",
+			name:     "Hourly dream memory check",
+			tool:     "dream",
+			args:     `{"operation":"check","threshold":100}`,
+			interval: 3600,
+			next:     now.Add(time.Hour),
+		},
+		{
+			id:       "default_meditate_daily",
+			name:     "Daily meditation check",
+			tool:     "meditate",
+			args:     `{"operation":"status","reason":"daily scheduled review"}`,
+			interval: 86400,
+			next:     now.Add(24 * time.Hour),
+		},
+	}
+	stamp := now.Format(time.RFC3339Nano)
+	for _, item := range defaults {
+		if _, err := db.Exec(`
+			INSERT OR IGNORE INTO scheduled_tool_calls(id, owner, name, tool_name, arguments_json, callback_json, run_at, interval_seconds, status, next_run_at, created_at, updated_at)
+			VALUES(?, 'system', ?, ?, ?, '{}', ?, ?, 'active', ?, ?, ?)
+		`, item.id, item.name, item.tool, item.args, item.next.Format(time.RFC3339Nano), item.interval, item.next.Format(time.RFC3339Nano), stamp, stamp); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func migrateTerminology(db *sql.DB) error {
+	if ok, err := tableExists(db, "short_term_summaries"); err != nil {
+		return err
+	} else if ok {
+		if _, err := db.Exec(`
+			INSERT OR IGNORE INTO short_term_summarizations(thread_id, content, up_to_seq, source_messages, updated_at, metadata_json)
+			SELECT thread_id, content, up_to_seq, source_messages, updated_at, metadata_json
+			FROM short_term_summaries
+		`); err != nil {
+			return err
+		}
+	}
+	if ok, err := tableExists(db, "scheduled_tool_calls"); err != nil {
+		return err
+	} else if ok {
+		_, _ = db.Exec(`UPDATE scheduled_tool_calls SET tool_name = 'meditate', name = CASE WHEN name = 'Daily soul optimization check' THEN 'Daily meditation check' ELSE name END, arguments_json = REPLACE(arguments_json, 'soul_optimize', 'meditate'), updated_at = ? WHERE tool_name = 'soul_optimize'`, time.Now().Format(time.RFC3339Nano))
+		var hasNew int
+		_ = db.QueryRow(`SELECT COUNT(*) FROM scheduled_tool_calls WHERE id = 'default_meditate_daily'`).Scan(&hasNew)
+		if hasNew == 0 {
+			_, _ = db.Exec(`UPDATE scheduled_tool_calls SET id = 'default_meditate_daily', name = 'Daily meditation check', tool_name = 'meditate', arguments_json = '{"operation":"status","reason":"daily scheduled review"}', updated_at = ? WHERE id = 'default_soul_daily'`, time.Now().Format(time.RFC3339Nano))
+		} else {
+			_, _ = db.Exec(`DELETE FROM scheduled_tool_calls WHERE id = 'default_soul_daily'`)
+		}
+	}
+	if ok, err := tableExists(db, "orchestrator_events"); err != nil {
+		return err
+	} else if ok {
+		_, _ = db.Exec(`UPDATE orchestrator_events SET function_name = REPLACE(function_name, 'soul_optimize', 'meditate') WHERE function_name LIKE '%soul_optimize%'`)
+		_, _ = db.Exec(`UPDATE orchestrator_events SET function_name = REPLACE(function_name, 'summary', 'summarize') WHERE function_name LIKE '%summary%'`)
+	}
+	return nil
+}
+
+func tableExists(db *sql.DB, name string) (bool, error) {
+	var count int
+	err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, name).Scan(&count)
+	return count > 0, err
+}
+
+func migrateUnifiedToolColumns(db *sql.DB) error {
+	adds := []struct {
+		table string
+		name  string
+		def   string
+	}{
+		{"long_term_memories", "model_id", "INTEGER"},
+		{"long_term_memories", "category", "TEXT NOT NULL DEFAULT ''"},
+		{"long_term_memories", "tags_json", "TEXT NOT NULL DEFAULT '[]'"},
+		{"long_term_memories", "confidence", "INTEGER NOT NULL DEFAULT 70"},
+		{"long_term_memories", "recalled_count", "INTEGER NOT NULL DEFAULT 0"},
+		{"long_term_memories", "used_count", "INTEGER NOT NULL DEFAULT 0"},
+		{"long_term_memories", "last_used_at", "TEXT"},
+		{"long_term_memories", "source_message_id", "TEXT"},
+		{"long_term_memories", "status", "TEXT NOT NULL DEFAULT 'active'"},
+	}
+	for _, add := range adds {
+		if err := addColumnIfMissing(db, add.table, add.name, add.def); err != nil {
+			return err
+		}
+	}
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_ltm_model_id ON long_term_memories(model_id) WHERE model_id IS NOT NULL`); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_ltm_category ON long_term_memories(agent_id, category, status)`); err != nil {
+		return err
+	}
+	if err := backfillMemoryModelIDs(db); err != nil {
+		return err
+	}
+	return nil
+}
+
+func addColumnIfMissing(db *sql.DB, table, column, def string) error {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var dflt any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + def)
+	return err
+}
+
+func backfillMemoryModelIDs(db *sql.DB) error {
+	rows, err := db.Query(`SELECT id FROM long_term_memories WHERE model_id IS NULL ORDER BY created_at, id`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	var next int
+	_ = db.QueryRow(`SELECT COALESCE(MAX(model_id), 0) + 1 FROM long_term_memories`).Scan(&next)
+	for _, id := range ids {
+		if _, err := db.Exec(`UPDATE long_term_memories SET model_id = ? WHERE id = ?`, next, id); err != nil {
+			return err
+		}
+		next++
+	}
+	return nil
 }
 
 func loadMessageAttachments(db *sql.DB, messageID string) ([]string, []string, error) {
@@ -681,14 +882,14 @@ func newID(prefix string) string {
 
 func defaultPEConfig() PEConfig {
 	return PEConfig{
-		LongMemoryTopN:        8,
-		LongMemoryRandomM:     3,
-		RecentMessagesK:       24,
+		LongMemoryTopN:        5,
+		LongMemoryRandomM:     5,
+		RecentMessagesK:       40,
 		MessageWindowSize:     defaultWindowSize,
 		MaxPromptChars:        24000,
 		MaxRoleChars:          2000,
 		MaxSectionChars:       5000,
-		SummaryRefreshEvery:   30,
+		SummarizeEvery:        20,
 		ReferenceImageTimeout: 10 * time.Minute,
 	}
 }
@@ -706,11 +907,20 @@ func loadPromptContext(path string, cfg PEConfig) (PromptContext, error) {
 		return PromptContext{}, err
 	}
 	role, _ := os.ReadFile("character.md")
+	behavior, _ := os.ReadFile("behavior_guidance.md")
+	rolePrompt := strings.TrimSpace(string(role))
+	if strings.TrimSpace(string(behavior)) != "" {
+		rolePrompt += "\n\n## Behavior Guidance\n" + strings.TrimSpace(string(behavior))
+	}
 	memories, err := recallLongTermMemories(db, cfg.LongMemoryTopN, cfg.LongMemoryRandomM)
 	if err != nil {
 		return PromptContext{}, err
 	}
-	summary, err := loadShortTermSummary(db, defaultThreadID)
+	memoryIndex, err := loadMemoryIndex(db)
+	if err != nil {
+		return PromptContext{}, err
+	}
+	summarization, err := loadShortTermSummarization(db, defaultThreadID)
 	if err != nil {
 		return PromptContext{}, err
 	}
@@ -735,16 +945,17 @@ func loadPromptContext(path string, cfg PEConfig) (PromptContext, error) {
 		return PromptContext{}, err
 	}
 	return PromptContext{
-		Config:      cfg,
-		RolePrompt:  string(role),
-		Memories:    memories,
-		Summary:     summary,
-		Recent:      recent,
-		RoleState:   roleState,
-		UserProfile: userProfile,
-		UserContext: userContext,
-		Environment: env,
-		Now:         time.Now(),
+		Config:        cfg,
+		RolePrompt:    rolePrompt,
+		Memories:      memories,
+		MemoryIndex:   memoryIndex,
+		Summarization: summarization,
+		Recent:        recent,
+		RoleState:     roleState,
+		UserProfile:   userProfile,
+		UserContext:   userContext,
+		Environment:   env,
+		Now:           time.Now(),
 	}, nil
 }
 
@@ -767,14 +978,24 @@ func seedMemoriesFromMarkdown(db *sql.DB) error {
 		if part == "" {
 			continue
 		}
+		modelID, err := nextMemoryModelID(db)
+		if err != nil {
+			return err
+		}
 		if _, err := db.Exec(`
-			INSERT INTO long_term_memories(id, agent_id, user_id, content, rank, source, created_at, updated_at)
-			VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-		`, newID("mem"), defaultAgentID, defaultUserID, part, 3, "memories.md", now, now); err != nil {
+			INSERT INTO long_term_memories(id, model_id, agent_id, user_id, content, rank, source, created_at, updated_at)
+			VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, newID("mem"), modelID, defaultAgentID, defaultUserID, part, 3, "memories.md", now, now); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func nextMemoryModelID(db *sql.DB) (int, error) {
+	var next int
+	err := db.QueryRow(`SELECT COALESCE(MAX(model_id), 0) + 1 FROM long_term_memories`).Scan(&next)
+	return next, err
 }
 
 func splitMemoryMarkdown(src string) []string {
@@ -818,8 +1039,8 @@ func recallLongTermMemories(db *sql.DB, topN, randomM int) ([]LongTermMemory, er
 		defer rows.Close()
 		for rows.Next() {
 			var m LongTermMemory
-			var last, created, updated sql.NullString
-			if err := rows.Scan(&m.ID, &m.Content, &m.Rank, &m.RecallCount, &last, &created, &updated); err != nil {
+			var last, lastUsed, sourceMessage, created, updated sql.NullString
+			if err := rows.Scan(&m.ID, &m.ModelID, &m.Content, &m.Category, &m.TagsJSON, &m.Rank, &m.Confidence, &m.RecallCount, &m.RecalledCount, &m.UsedCount, &last, &lastUsed, &sourceMessage, &m.Status, &created, &updated); err != nil {
 				return err
 			}
 			if seen[m.ID] {
@@ -827,6 +1048,8 @@ func recallLongTermMemories(db *sql.DB, topN, randomM int) ([]LongTermMemory, er
 			}
 			seen[m.ID] = true
 			m.LastRecalledAt, _ = time.Parse(time.RFC3339Nano, last.String)
+			m.LastUsedAt, _ = time.Parse(time.RFC3339Nano, lastUsed.String)
+			m.SourceMessageID = sourceMessage.String
 			m.CreatedAt, _ = time.Parse(time.RFC3339Nano, created.String)
 			m.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated.String)
 			memories = append(memories, m)
@@ -835,10 +1058,10 @@ func recallLongTermMemories(db *sql.DB, topN, randomM int) ([]LongTermMemory, er
 	}
 	if topN > 0 {
 		rows, err := db.Query(`
-			SELECT id, content, rank, recall_count, last_recalled_at, created_at, updated_at
+			SELECT id, model_id, content, category, tags_json, rank, confidence, recall_count, recalled_count, used_count, last_recalled_at, last_used_at, source_message_id, status, created_at, updated_at
 			FROM long_term_memories
-			WHERE agent_id = ? AND deleted_at IS NULL
-			ORDER BY (rank * 1000000 + recall_count * 1000 + strftime('%s', updated_at)) DESC
+			WHERE agent_id = ? AND deleted_at IS NULL AND status = 'active'
+			ORDER BY (rank * 1000000 + used_count * 1000 + strftime('%s', updated_at)) DESC
 			LIMIT ?
 		`, defaultAgentID, topN)
 		if err != nil {
@@ -850,9 +1073,9 @@ func recallLongTermMemories(db *sql.DB, topN, randomM int) ([]LongTermMemory, er
 	}
 	if randomM > 0 {
 		rows, err := db.Query(`
-			SELECT id, content, rank, recall_count, last_recalled_at, created_at, updated_at
+			SELECT id, model_id, content, category, tags_json, rank, confidence, recall_count, recalled_count, used_count, last_recalled_at, last_used_at, source_message_id, status, created_at, updated_at
 			FROM long_term_memories
-			WHERE agent_id = ? AND deleted_at IS NULL
+			WHERE agent_id = ? AND deleted_at IS NULL AND status = 'active'
 			ORDER BY random()
 			LIMIT ?
 		`, defaultAgentID, randomM)
@@ -866,20 +1089,90 @@ func recallLongTermMemories(db *sql.DB, topN, randomM int) ([]LongTermMemory, er
 	if len(memories) > 0 {
 		now := time.Now().Format(time.RFC3339Nano)
 		for _, m := range memories {
-			_, _ = db.Exec(`UPDATE long_term_memories SET recall_count = recall_count + 1, last_recalled_at = ?, updated_at = ? WHERE id = ?`, now, now, m.ID)
+			_, _ = db.Exec(`UPDATE long_term_memories SET recalled_count = recalled_count + 1, recall_count = recall_count + 1, last_recalled_at = ?, updated_at = ? WHERE id = ?`, now, now, m.ID)
 		}
 	}
 	return memories, nil
 }
 
-func loadShortTermSummary(db *sql.DB, threadID string) (ShortTermSummary, error) {
+func loadMemoryIndex(db *sql.DB) (string, error) {
+	rows, err := db.Query(`
+		SELECT category, tags_json, COUNT(*)
+		FROM long_term_memories
+		WHERE agent_id = ? AND deleted_at IS NULL AND status = 'active'
+		GROUP BY category, tags_json
+	`, defaultAgentID)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	categories := map[string]int{}
+	tags := map[string]int{}
+	for rows.Next() {
+		var category, tagsJSON string
+		var count int
+		if err := rows.Scan(&category, &tagsJSON, &count); err != nil {
+			return "", err
+		}
+		category = strings.TrimSpace(category)
+		if category != "" {
+			categories[category] += count
+		}
+		var list []string
+		if json.Unmarshal([]byte(tagsJSON), &list) == nil {
+			for _, tag := range list {
+				tag = strings.TrimSpace(tag)
+				if tag != "" {
+					tags[tag] += count
+				}
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	if len(categories) == 0 && len(tags) == 0 {
+		return "No memory categories or tags yet. You may create concise categories and tags through the memory tool.", nil
+	}
+	return "categories=" + compactCountMap(categories, 24) + "\ntags=" + compactCountMap(tags, 40), nil
+}
+
+func compactCountMap(values map[string]int, limit int) string {
+	if len(values) == 0 {
+		return "(none)"
+	}
+	type pair struct {
+		key   string
+		count int
+	}
+	pairs := make([]pair, 0, len(values))
+	for k, v := range values {
+		pairs = append(pairs, pair{k, v})
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].count == pairs[j].count {
+			return pairs[i].key < pairs[j].key
+		}
+		return pairs[i].count > pairs[j].count
+	})
+	if len(pairs) > limit {
+		pairs = pairs[:limit]
+	}
+	parts := make([]string, 0, len(pairs))
+	for _, p := range pairs {
+		parts = append(parts, fmt.Sprintf("%s:%d", p.key, p.count))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func loadShortTermSummarization(db *sql.DB, threadID string) (ShortTermSummarization, error) {
 	now := time.Now().Format(time.RFC3339Nano)
-	_, _ = db.Exec(`INSERT OR IGNORE INTO short_term_summaries(thread_id, updated_at) VALUES(?, ?)`, threadID, now)
-	var s ShortTermSummary
+	_, _ = db.Exec(`INSERT OR IGNORE INTO short_term_summarizations(thread_id, updated_at) VALUES(?, ?)`, threadID, now)
+	var s ShortTermSummarization
 	var updated string
 	err := db.QueryRow(`
 		SELECT thread_id, content, up_to_seq, source_messages, updated_at
-		FROM short_term_summaries WHERE thread_id = ?
+		FROM short_term_summarizations WHERE thread_id = ?
 	`, threadID).Scan(&s.ThreadID, &s.Content, &s.UpToSeq, &s.SourceMessages, &updated)
 	s.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
 	return s, err

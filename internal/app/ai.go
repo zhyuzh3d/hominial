@@ -19,6 +19,10 @@ import (
 )
 
 func callResponses(ctx context.Context, cfg Config, historyPath string, peCfg PEConfig) (APIResult, error) {
+	return callResponsesWithContinuations(ctx, cfg, historyPath, peCfg, nil)
+}
+
+func callResponsesWithContinuations(ctx context.Context, cfg Config, historyPath string, peCfg PEConfig, continuations []ToolContinuation) (APIResult, error) {
 	if cfg.APIKey == "" {
 		return APIResult{}, errors.New("missing OPENAI_API_KEY in ~/.codex/auth.json or environment")
 	}
@@ -33,6 +37,12 @@ func callResponses(ctx context.Context, cfg Config, historyPath string, peCfg PE
 	envelope, err := buildPrompt(promptCtx)
 	if err != nil {
 		return APIResult{}, err
+	}
+	for _, continuation := range continuations {
+		extra := continuationToAPIInput(continuation)
+		if extra != nil {
+			envelope.Input = append(envelope.Input, extra)
+		}
 	}
 	body := map[string]any{
 		"model":  cfg.Model,
@@ -77,6 +87,30 @@ func callResponses(ctx context.Context, cfg Config, historyPath string, peCfg PE
 	message := Message{Role: "assistant", Text: text, Images: images, CreatedAt: time.Now(), ToolCalls: calls}
 	savePromptSnapshot(historyPath, "", envelope)
 	return APIResult{Message: message, ToolCalls: calls}, nil
+}
+
+func continuationToAPIInput(c ToolContinuation) map[string]any {
+	var b strings.Builder
+	b.WriteString("Tool callback result for this same turn. Continue the conversation using this result. Do not repeat the raw JSON unless it is useful to the user.\n")
+	if strings.TrimSpace(c.Text) != "" {
+		b.WriteString("\nText:\n")
+		b.WriteString(c.Text)
+	}
+	if len(c.Payload) > 0 {
+		raw, _ := json.MarshalIndent(c.Payload, "", "  ")
+		b.WriteString("\nPayload:\n")
+		b.Write(raw)
+	}
+	if strings.TrimSpace(b.String()) == "" {
+		return nil
+	}
+	return map[string]any{
+		"role": "user",
+		"content": []map[string]any{{
+			"type": "input_text",
+			"text": b.String(),
+		}},
+	}
 }
 
 func callReferenceImage(ctx context.Context, cfg Config, prompt string, refs []string) (Message, error) {

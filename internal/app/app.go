@@ -104,6 +104,7 @@ func NewChatApp(w *gioapp.Window) *ChatApp {
 	a.baseURL.SetText(cfg.BaseURL)
 	a.model.SetText(cfg.Model)
 	a.scrollList.Axis = layout.Vertical
+	go a.runSchedulerLoop()
 	return a
 }
 
@@ -247,23 +248,101 @@ func (a *ChatApp) send() {
 			a.messages = append(a.messages, reply)
 			a.status = "Ready"
 			a.mu.Unlock()
-			generated, orchErr := runOrchestrator(context.Background(), historyPath, cfg, reply.ID, result.ToolCalls)
+			orch, orchErr := runOrchestrator(context.Background(), historyPath, cfg, reply.ID, result.ToolCalls)
 			a.mu.Lock()
-			for i := range generated {
-				if err := saveMessageDB(historyPath, &generated[i]); err == nil {
-					a.messages = append(a.messages, generated[i])
+			for i := range orch.Messages {
+				if err := saveMessageDB(historyPath, &orch.Messages[i]); err == nil {
+					a.messages = append(a.messages, orch.Messages[i])
 				}
 			}
 			if orchErr != nil {
 				a.status = "Tool warning: " + orchErr.Error()
 			}
 			a.mu.Unlock()
-			if err := maybeRefreshShortSummary(context.Background(), cfg, historyPath, peCfg); err != nil {
-				a.setStatus("Summary warning: " + err.Error())
+			a.runContinuations(context.Background(), cfg, historyPath, peCfg, orch.Continuations)
+			if err := maybeRefreshShortSummarization(context.Background(), cfg, historyPath, peCfg); err != nil {
+				a.setStatus("Summarize warning: " + err.Error())
 			}
 		}
 		a.win.Invalidate()
 	}()
+}
+
+func (a *ChatApp) runContinuations(ctx context.Context, cfg Config, historyPath string, peCfg PEConfig, continuations []ToolContinuation) {
+	const maxContinuationDepth = 3
+	for depth := 0; depth < maxContinuationDepth && len(continuations) > 0; depth++ {
+		a.setStatus("Continuing with tool results...")
+		result, err := callResponsesWithContinuations(ctx, cfg, historyPath, peCfg, continuations)
+		if err != nil {
+			a.setStatus("Continuation warning: " + err.Error())
+			return
+		}
+		reply := result.Message
+		if strings.TrimSpace(reply.Text) == "" && len(reply.Images) == 0 && len(reply.ToolCalls) == 0 {
+			return
+		}
+		if err := saveMessageDB(historyPath, &reply); err != nil {
+			a.setStatus("History save failed: " + err.Error())
+			return
+		}
+		a.mu.Lock()
+		a.messages = append(a.messages, reply)
+		a.mu.Unlock()
+		a.win.Invalidate()
+
+		orch, orchErr := runOrchestrator(ctx, historyPath, cfg, reply.ID, result.ToolCalls)
+		a.mu.Lock()
+		for i := range orch.Messages {
+			if err := saveMessageDB(historyPath, &orch.Messages[i]); err == nil {
+				a.messages = append(a.messages, orch.Messages[i])
+			}
+		}
+		if orchErr != nil {
+			a.status = "Tool warning: " + orchErr.Error()
+		} else {
+			a.status = "Ready"
+		}
+		a.mu.Unlock()
+		a.win.Invalidate()
+		continuations = orch.Continuations
+	}
+	if len(continuations) > 0 {
+		a.setStatus("Continuation stopped after safety limit")
+	}
+}
+
+func (a *ChatApp) runSchedulerLoop() {
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	for {
+		<-timer.C
+		a.runDueScheduledTools()
+		timer.Reset(time.Minute)
+	}
+}
+
+func (a *ChatApp) runDueScheduledTools() {
+	a.mu.Lock()
+	cfg := a.cfg
+	historyPath := a.historyPath
+	a.mu.Unlock()
+	messages, err := executeDueScheduledTools(context.Background(), historyPath, cfg, 10)
+	if err != nil {
+		a.setStatus("Schedule warning: " + err.Error())
+		return
+	}
+	if len(messages) == 0 {
+		return
+	}
+	a.mu.Lock()
+	for i := range messages {
+		if err := saveMessageDB(historyPath, &messages[i]); err == nil {
+			a.messages = append(a.messages, messages[i])
+		}
+	}
+	a.status = "Scheduled task completed"
+	a.mu.Unlock()
+	a.win.Invalidate()
 }
 
 func (a *ChatApp) loadOlderMessages() {

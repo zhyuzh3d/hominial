@@ -1,3 +1,7 @@
 chengcheng-chat
 app_outputs/
 outputs/
+.env
+.env.*
+auth.json
+config.local.toml

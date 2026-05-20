@@ -36,7 +36,7 @@ Each model request should be assembled by a PE builder from these components:
 
 - Role setting: up to 2k characters from `character.md`, covering persona, personality, history, behavior rules, appearance, and goals.
 - Long-term memory recall: top `n` important memories and random `m` memories from SQLite. Importance combines recency, recall count, and rank.
-- Short-term memory compression: a cumulative summary of messages older than the recent message window, updated periodically through a model summary call.
+- Short-term memory compression: a cumulative summarization of messages older than the recent message window, updated periodically through a model summarization call.
 - Recent `k` messages: newest conversation messages with attachment/image references when present.
 - Role context: health, mental state, mood, current action, current purpose, short-term/long-term goal scores, control score, behavior effectiveness score.
 - User profile: user-set fields and character-estimated fields.
@@ -54,7 +54,7 @@ The orchestrator is the hub for model-requested function calls. It must:
 - Parse function calls from Responses API output.
 - Execute approved local functions.
 - Persist function calls and results.
-- Update long-term memories, role context, user profile, user context, environment state, and summary metadata.
+- Update long-term memories, role context, user profile, user context, environment state, and summarize metadata.
 - Support extension without scattering function handling throughout UI or API code.
 
 ## 5. Automatic Reference-Image Drawing
@@ -80,7 +80,7 @@ The model can call `create_reference_image` with a prompt and local reference im
 - The app starts and restores recent history from SQLite.
 - New messages append without damaging older rows.
 - Older messages can be loaded into the window.
-- PE builder injects role, memories, summary, state, user, environment, functions, and recent messages.
+- PE builder injects role, memories, summarize, state, user, environment, functions, and recent messages.
 - Function calls are logged and handled by the orchestrator.
 - `create_reference_image` can generate an assistant image message from local reference image paths.
 - Chat UI uses stable left/right bubble layout and remains scrollable/clickable.

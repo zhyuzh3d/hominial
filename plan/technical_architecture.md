@@ -26,7 +26,7 @@ Existing tables are preserved:
 New PE tables:
 
 - `long_term_memories`: durable character memories with `rank`, `recall_count`, and recall timestamps.
-- `short_term_summaries`: cumulative thread summary and message range metadata.
+- `short_term_summarizations`: cumulative thread summarize and message range metadata.
 - `role_states`: current character health, mood, action, goals, scores, and metadata.
 - `user_profiles`: user-set and character-estimated profile JSON.
 - `user_contexts`: latest estimated user state and prediction/evaluation JSON.
@@ -57,7 +57,7 @@ Budget policy:
 
 - Role prompt: max 2k characters.
 - Long memories: top `n` + random `m`, each truncated.
-- Summary: bounded.
+- Summarize: bounded.
 - Recent messages: newest `k`.
 - Lower priority sections are truncated first.
 - Final system section is clipped to the configured target budget if needed.
@@ -72,7 +72,7 @@ Registered functions:
 - `update_user_profile`
 - `update_user_context`
 - `update_environment_state`
-- `request_summary_refresh`
+- `request_summarize_refresh`
 - `create_reference_image`
 
 Function execution is intentionally local and explicit. Unknown function calls are logged as unsupported instead of failing the whole chat.
@@ -86,7 +86,7 @@ Function execution is intentionally local and explicit. Unknown function calls a
 5. API streams text, image results, and function call items.
 6. Assistant message is appended to SQLite.
 7. Orchestrator executes function calls and appends any generated image message.
-8. Summary refresh runs when requested or when the old-message threshold is crossed.
+8. Summarize refresh runs when requested or when the old-message threshold is crossed.
 
 ## 7. Reliability Rules
 

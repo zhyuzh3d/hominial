@@ -12,13 +12,13 @@ import (
 	"time"
 )
 
-func maybeRefreshShortSummary(ctx context.Context, cfg Config, path string, peCfg PEConfig) error {
+func maybeRefreshShortSummarization(ctx context.Context, cfg Config, path string, peCfg PEConfig) error {
 	db, err := openHistoryDB(path)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
-	summary, err := loadShortTermSummary(db, defaultThreadID)
+	summarization, err := loadShortTermSummarization(db, defaultThreadID)
 	if err != nil {
 		return err
 	}
@@ -26,24 +26,28 @@ func maybeRefreshShortSummary(ctx context.Context, cfg Config, path string, peCf
 	if err := db.QueryRow(`SELECT COALESCE(MAX(seq), 0), COUNT(*) FROM messages WHERE thread_id = ? AND deleted_at IS NULL`, defaultThreadID).Scan(&maxSeq, &count); err != nil {
 		return err
 	}
-	targetSeq := maxSeq - peCfg.RecentMessagesK
-	if targetSeq <= 0 || targetSeq <= summary.UpToSeq || targetSeq-summary.UpToSeq < peCfg.SummaryRefreshEvery {
+	oldestUncompressedSeq := maxSeq - peCfg.RecentMessagesK
+	if oldestUncompressedSeq <= 0 || oldestUncompressedSeq <= summarization.UpToSeq || oldestUncompressedSeq-summarization.UpToSeq < peCfg.SummarizeEvery {
 		return nil
 	}
-	msgs, err := loadMessagesThroughSeq(db, defaultThreadID, summary.UpToSeq, targetSeq, 80)
+	targetSeq := summarization.UpToSeq + peCfg.SummarizeEvery
+	if targetSeq > oldestUncompressedSeq {
+		targetSeq = oldestUncompressedSeq
+	}
+	msgs, err := loadMessagesThroughSeq(db, defaultThreadID, summarization.UpToSeq, targetSeq, peCfg.SummarizeEvery)
 	if err != nil {
 		return err
 	}
 	if len(msgs) == 0 {
 		return nil
 	}
-	next, err := generateShortSummary(ctx, cfg, summary.Content, msgs)
+	next, err := generateShortSummarization(ctx, cfg, summarization.Content, msgs)
 	if err != nil {
 		return err
 	}
 	now := time.Now().Format(time.RFC3339Nano)
 	_, err = db.Exec(`
-		INSERT INTO short_term_summaries(thread_id, content, up_to_seq, source_messages, updated_at)
+		INSERT INTO short_term_summarizations(thread_id, content, up_to_seq, source_messages, updated_at)
 		VALUES(?, ?, ?, ?, ?)
 		ON CONFLICT(thread_id) DO UPDATE SET content = excluded.content, up_to_seq = excluded.up_to_seq, source_messages = excluded.source_messages, updated_at = excluded.updated_at
 	`, defaultThreadID, next, targetSeq, count, now)
@@ -81,7 +85,7 @@ func loadMessagesThroughSeq(db *sql.DB, threadID string, afterSeq, throughSeq, l
 	return reversed, nil
 }
 
-func generateShortSummary(ctx context.Context, cfg Config, previous string, msgs []Message) (string, error) {
+func generateShortSummarization(ctx context.Context, cfg Config, previous string, msgs []Message) (string, error) {
 	if cfg.APIKey == "" {
 		return "", nil
 	}
@@ -93,7 +97,8 @@ func generateShortSummary(ctx context.Context, cfg Config, previous string, msgs
 		}
 		fmt.Fprintf(&transcript, "%s: %s\n", m.Role, trimRunes(text, 800))
 	}
-	prompt := "Update the cumulative short-term memory summary. Prefer recent information, preserve stable facts, goals, unresolved tasks, emotional context, and relationship continuity. Return only the updated summary.\n\nPrevious summary:\n" + emptyDefault(previous, "(empty)") + "\n\nNew transcript:\n" + transcript.String()
+	template := readTextDefault("prompts/summarize_prompt.md", "Update the cumulative short-term memory summarization. Prefer recent information, preserve stable facts, goals, unresolved tasks, emotional context, and relationship continuity. Return only the updated summarization.")
+	prompt := template + "\n\nPrevious summarization:\n" + emptyDefault(previous, "(empty)") + "\n\nNew transcript:\n" + transcript.String()
 	body := map[string]any{
 		"model":  cfg.Model,
 		"stream": true,
@@ -124,7 +129,7 @@ func generateShortSummary(ctx context.Context, cfg Config, previous string, msgs
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		raw, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("summary api %s: %s", resp.Status, trimForStatus(raw))
+		return "", fmt.Errorf("summarize api %s: %s", resp.Status, trimForStatus(raw))
 	}
 	text, _, _, err := parseResponseStream(resp.Body)
 	if err != nil {

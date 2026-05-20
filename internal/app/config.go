@@ -10,7 +10,7 @@ import (
 func loadConfig() Config {
 	home, _ := os.UserHomeDir()
 	cfg := Config{
-		BaseURL: "https://ai.martin98.top/v1",
+		BaseURL: "https://api.openai.com/v1",
 		Model:   "gpt-5.5",
 		APIKey:  os.Getenv("OPENAI_API_KEY"),
 	}
