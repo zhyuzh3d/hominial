@@ -310,3 +310,98 @@ func TestTerminologyMigration(t *testing.T) {
 		t.Fatalf("expected meditate tool, got %q", tool)
 	}
 }
+
+func TestEvaluateTurnUpdatesStateAndLatency(t *testing.T) {
+	path, cleanup := testDB(t)
+	defer cleanup()
+	base := time.Now().Add(-10 * time.Minute)
+	prevAssistant := Message{Role: "assistant", Text: "上一轮回复", CreatedAt: base}
+	if err := saveMessageDB(path, &prevAssistant); err != nil {
+		t.Fatal(err)
+	}
+	user := Message{Role: "user", Text: "用户真实反应", CreatedAt: base.Add(2 * time.Minute)}
+	if err := saveMessageDB(path, &user); err != nil {
+		t.Fatal(err)
+	}
+	assistant := Message{Role: "assistant", Text: "本轮回复", CreatedAt: base.Add(3 * time.Minute)}
+	if err := saveMessageDB(path, &assistant); err != nil {
+		t.Fatal(err)
+	}
+	db, err := openHistoryDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	result, _, err := executeEvaluateTurnTool(db, map[string]any{
+		"previous_prediction":    map[string]any{"response_type": "continue", "confidence": 70},
+		"actual_user_behavior":   map[string]any{"response_type": "continue", "topic": "架构", "mood": "focused", "action": "refine"},
+		"prediction_match":       map[string]any{"overall": 82, "topic": 80, "latency": 70},
+		"control_score":          82,
+		"behavior_effectiveness": 79,
+		"short_goal":             map[string]any{"content": "定义自评闭环", "distance": 20, "angle": 85},
+		"long_goal":              map[string]any{"content": "形成 hominial 运行时", "distance": 55, "angle": 75},
+		"interaction_strategy":   map[string]any{"current": "精确定义机制", "next_move": "落 schema", "avoid": "表面化共情"},
+		"next_prediction":        map[string]any{"response_type": "ask_implementation", "reply_latency": map[string]any{"bucket": "fast", "seconds_min": 30, "seconds_max": 240}, "confidence": 76},
+	}, assistant.ID)
+	if err != nil {
+		t.Fatalf("evaluate turn: %v", err)
+	}
+	if result["reply_latency_seconds"] != 120 {
+		t.Fatalf("expected latency 120, got %#v", result["reply_latency_seconds"])
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM turn_evaluations`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("expected one turn evaluation, got %d", count)
+	}
+	roleState, err := loadRoleState(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if roleState.ControlScore != 82 || roleState.ShortGoalCloseness != 80 || roleState.ShortGoalDeviation != 15 {
+		t.Fatalf("unexpected role state: %#v", roleState)
+	}
+	userContext, err := loadUserContext(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(userContext.NextActionPrediction, "ask_implementation") || !strings.Contains(userContext.EvaluationJSON, "reply_latency_seconds") {
+		t.Fatalf("unexpected user context: %#v", userContext)
+	}
+}
+
+func TestDreamSynthesizesDialogueExperienceFromTurnEvaluations(t *testing.T) {
+	path, cleanup := testDB(t)
+	defer cleanup()
+	db, err := openHistoryDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for i := 0; i < 3; i++ {
+		_, _, err := executeEvaluateTurnTool(db, map[string]any{
+			"actual_user_behavior":   map[string]any{"response_type": "deepen", "topic": "系统架构"},
+			"prediction_match":       map[string]any{"overall": 82},
+			"control_score":          80 + i,
+			"behavior_effectiveness": 78,
+			"short_goal":             map[string]any{"content": "推进设计", "distance": 25, "angle": 80},
+			"long_goal":              map[string]any{"content": "形成 hominial", "distance": 60, "angle": 78},
+			"interaction_strategy":   map[string]any{"current": "先统一概念，再进入实现细节"},
+			"next_prediction":        map[string]any{"response_type": "ask_implementation", "confidence": 75},
+		}, "")
+		if err != nil {
+			t.Fatalf("evaluate %d: %v", i, err)
+		}
+	}
+	result, _, err := executeDreamTool(nil, db, Config{}, map[string]any{"operation": "run", "threshold": float64(100)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied, _ := result["applied"].(map[string]any)
+	if applied["dialogue_experience_memory_id"] == nil {
+		t.Fatalf("expected dialogue experience synthesis, got %#v", result)
+	}
+}

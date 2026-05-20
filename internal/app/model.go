@@ -87,6 +87,24 @@ type ShortTermSummarization struct {
 	UpdatedAt      time.Time
 }
 
+type TurnEvaluation struct {
+	ID                    string
+	ThreadID              string
+	AssistantMessageID    string
+	Seq                   int
+	PreviousPrediction    string
+	ActualBehavior        string
+	PredictionMatch       string
+	ControlScore          int
+	BehaviorEffectiveness int
+	ShortGoal             string
+	LongGoal              string
+	InteractionStrategy   string
+	NextPrediction        string
+	RawJSON               string
+	CreatedAt             time.Time
+}
+
 type RoleState struct {
 	Health                string
 	Mental                string
@@ -131,17 +149,18 @@ type EnvironmentState struct {
 }
 
 type PromptContext struct {
-	Config        PEConfig
-	RolePrompt    string
-	Memories      []LongTermMemory
-	MemoryIndex   string
-	Summarization ShortTermSummarization
-	Recent        []Message
-	RoleState     RoleState
-	UserProfile   UserProfile
-	UserContext   UserContext
-	Environment   EnvironmentState
-	Now           time.Time
+	Config                PEConfig
+	RolePrompt            string
+	Memories              []LongTermMemory
+	MemoryIndex           string
+	Summarization         ShortTermSummarization
+	TurnEvaluationContext string
+	Recent                []Message
+	RoleState             RoleState
+	UserProfile           UserProfile
+	UserContext           UserContext
+	Environment           EnvironmentState
+	Now                   time.Time
 }
 
 type PromptEnvelope struct {

@@ -63,11 +63,16 @@ func runDreamWorkflow(ctx context.Context, db *sql.DB, cfg Config, args map[stri
 	if err != nil {
 		return nil, err
 	}
+	evaluations, err := collectTurnEvaluations(db, 80)
+	if err != nil {
+		return nil, err
+	}
 	candidateIDs := memoryIDs(memories)
 	result := map[string]any{
 		"operation":           operation,
 		"threshold":           threshold,
 		"active_memories":     len(memories),
+		"turn_evaluations":    len(evaluations),
 		"candidate_ids":       candidateIDs,
 		"needs_consolidation": len(memories) >= threshold,
 	}
@@ -98,6 +103,9 @@ func runDreamWorkflow(ctx context.Context, db *sql.DB, cfg Config, args map[stri
 	applied["deterministic_archive_ids"] = archiveIDs
 	if len(duplicateNotes) > 0 {
 		applied["deterministic_notes"] = duplicateNotes
+	}
+	if experienceID, ok := synthesizeDialogueExperienceMemory(db, evaluations); ok {
+		applied["dialogue_experience_memory_id"] = experienceID
 	}
 
 	if cfg.APIKey != "" && len(memories) > 0 {
@@ -149,9 +157,10 @@ func runMeditateWorkflow(ctx context.Context, db *sql.DB, cfg Config, args map[s
 		return nil, err
 	}
 	result["context"] = map[string]any{
-		"recent_messages": contextPack["recent_message_count"],
-		"recent_events":   contextPack["recent_event_count"],
-		"memory_count":    contextPack["memory_count"],
+		"recent_messages":  contextPack["recent_message_count"],
+		"recent_events":    contextPack["recent_event_count"],
+		"memory_count":     contextPack["memory_count"],
+		"turn_evaluations": contextPack["turn_evaluation_count"],
 	}
 	if cfg.APIKey == "" {
 		result["status"] = "skipped"
@@ -315,18 +324,24 @@ func collectMeditationContext(db *sql.DB) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	evaluations, err := collectTurnEvaluations(db, 80)
+	if err != nil {
+		return nil, err
+	}
 	docs := map[string]string{}
 	for _, path := range allowedMeditationDocuments() {
 		docs[path] = readTextDefault(path, "")
 	}
 	return map[string]any{
-		"recent_message_count": len(recentMessages),
-		"recent_event_count":   len(events),
-		"memory_count":         len(memories),
-		"recent_messages":      messagesForWorkflow(recentMessages),
-		"memories":             memories,
-		"events":               events,
-		"documents":            docs,
+		"recent_message_count":  len(recentMessages),
+		"recent_event_count":    len(events),
+		"memory_count":          len(memories),
+		"turn_evaluation_count": len(evaluations),
+		"recent_messages":       messagesForWorkflow(recentMessages),
+		"memories":              memories,
+		"turn_evaluations":      evaluations,
+		"events":                events,
+		"documents":             docs,
 	}, nil
 }
 
@@ -449,6 +464,100 @@ func recentWorkflowEvents(db *sql.DB, limit int) ([]map[string]any, error) {
 		})
 	}
 	return events, rows.Err()
+}
+
+func collectTurnEvaluations(db *sql.DB, limit int) ([]map[string]any, error) {
+	if limit <= 0 {
+		limit = 80
+	}
+	rows, err := db.Query(`
+		SELECT seq, previous_prediction_json, actual_behavior_json, prediction_match_json, control_score,
+			behavior_effectiveness, short_goal_json, long_goal_json, interaction_strategy_json, next_prediction_json, created_at
+		FROM turn_evaluations
+		WHERE thread_id = ?
+		ORDER BY seq DESC, created_at DESC
+		LIMIT ?
+	`, defaultThreadID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var evaluations []map[string]any
+	for rows.Next() {
+		var seq, control, effectiveness int
+		var previous, actual, match, shortGoal, longGoal, strategy, next, created string
+		if err := rows.Scan(&seq, &previous, &actual, &match, &control, &effectiveness, &shortGoal, &longGoal, &strategy, &next, &created); err != nil {
+			return nil, err
+		}
+		evaluations = append(evaluations, map[string]any{
+			"seq":                    seq,
+			"previous_prediction":    jsonRawObject(previous),
+			"actual_user_behavior":   jsonRawObject(actual),
+			"prediction_match":       jsonRawObject(match),
+			"control_score":          control,
+			"behavior_effectiveness": effectiveness,
+			"short_goal":             jsonRawObject(shortGoal),
+			"long_goal":              jsonRawObject(longGoal),
+			"interaction_strategy":   jsonRawObject(strategy),
+			"next_prediction":        jsonRawObject(next),
+			"created_at":             created,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for i, j := 0, len(evaluations)-1; i < j; i, j = i+1, j-1 {
+		evaluations[i], evaluations[j] = evaluations[j], evaluations[i]
+	}
+	return evaluations, nil
+}
+
+func synthesizeDialogueExperienceMemory(db *sql.DB, evaluations []map[string]any) (int, bool) {
+	if len(evaluations) < 3 {
+		return 0, false
+	}
+	var totalControl, totalMatch, count int
+	var latestStrategy string
+	for _, evaluation := range evaluations {
+		control, _ := evaluation["control_score"].(int)
+		totalControl += control
+		if match, ok := evaluation["prediction_match"].(map[string]any); ok {
+			totalMatch += intFromAny(match["overall"], 0)
+		}
+		if strategy, ok := evaluation["interaction_strategy"].(map[string]any); ok {
+			if current, _ := strategy["current"].(string); strings.TrimSpace(current) != "" {
+				latestStrategy = current
+			}
+		}
+		count++
+	}
+	if count == 0 || strings.TrimSpace(latestStrategy) == "" {
+		return 0, false
+	}
+	avgControl := totalControl / count
+	avgMatch := totalMatch / count
+	if avgControl < 65 && avgMatch < 65 {
+		return 0, false
+	}
+	content := fmt.Sprintf("Recent interaction experience: when control_score averages %d and prediction_match averages %d, Elli's effective strategy is: %s", avgControl, avgMatch, latestStrategy)
+	var existing int
+	like := "%" + trimRunes(latestStrategy, 80) + "%"
+	_ = db.QueryRow(`SELECT COALESCE(model_id, 0) FROM long_term_memories WHERE agent_id = ? AND category = 'dialogue_experience' AND content LIKE ? AND deleted_at IS NULL AND status = 'active' LIMIT 1`, defaultAgentID, like).Scan(&existing)
+	if existing > 0 {
+		return existing, false
+	}
+	result, _, err := memoryUpsert(db, map[string]any{
+		"content":    content,
+		"category":   "dialogue_experience",
+		"tags":       []string{"predictive_empathy", "interaction_strategy"},
+		"rank":       6,
+		"confidence": 75,
+	})
+	if err != nil {
+		return 0, false
+	}
+	id, _ := result["id"].(int)
+	return id, id > 0
 }
 
 func messagesForWorkflow(messages []Message) []map[string]any {

@@ -16,6 +16,7 @@ func buildPrompt(ctx PromptContext) (PromptEnvelope, error) {
 	sections["memory"] = formatMemories(ctx.Memories, cfg.MaxSectionChars)
 	sections["memory_index"] = trimRunes(ctx.MemoryIndex, cfg.MaxSectionChars/2)
 	sections["summarization"] = trimRunes(ctx.Summarization.Content, cfg.MaxSectionChars)
+	sections["turn_evaluations"] = trimRunes(ctx.TurnEvaluationContext, cfg.MaxSectionChars)
 	sections["role_context"] = formatRoleContext(ctx.RoleState)
 	sections["user_profile"] = formatUserProfile(ctx.UserProfile)
 	sections["user_context"] = formatUserContext(ctx.UserContext)
@@ -89,6 +90,7 @@ func composeSystemPrompt(sections map[string]string, maxChars int) string {
 		{"memory_index", "Memory Categories And Tags"},
 		{"memory", "Long-Term Memory Recall"},
 		{"summarization", "Short-Term Memory Summarization"},
+		{"turn_evaluations", "Predictive Empathy Loop"},
 		{"role_context", "Role Context"},
 		{"user_profile", "User Profile"},
 		{"user_context", "User Context"},
@@ -167,7 +169,9 @@ metadata=%s`, now.Format("2006-01-02 15:04:05 MST"), now.Weekday().String(), emp
 }
 
 func functionPolicyText() string {
-	return `Use only the model-visible tools when you need actions. Prefer compact unified tools: db, memory, query, sendmsg, selfie, notify, schedule, summarize, dream, and meditate. A callback is another tool call; use callback.tool="sendmsg" to send a tool result to the user, to yourself for continuation, or to the internal event stream. user_set_profile is read-only; write only your own estimated user profile. Memory IDs are shown as M<number>. Mark a memory as used only when you actually relied on it in this reply; recalled memories are not automatically used. When updating scores, use 0-100 integers. Compare your previous prediction against the user's actual reply before updating control_score and behavior_effectiveness.`
+	return `Use only the model-visible tools when you need actions. Prefer compact unified tools: db, memory, query, evaluate_turn, sendmsg, selfie, notify, schedule, summarize, dream, and meditate. A callback is another tool call; use callback.tool="sendmsg" to send a tool result to the user, to yourself for continuation, or to the internal event stream. user_set_profile is read-only; write only your own estimated user profile. Memory IDs are shown as M<number>. Mark a memory as used only when you actually relied on it in this reply; recalled memories are not automatically used.
+
+Predictive empathy is the core self-evaluation loop. control_score means grasp of topic flow, interaction rhythm, emotional field, and conversational dynamics; it does not mean control over the user. After each meaningful assistant reply, call evaluate_turn to compare the previous prediction with the user's actual behavior, update control_score, update short/long goal distance and angle, patch the real-time interaction_strategy, and write the next_prediction. Predict response latency as part of next_prediction. Use 0-100 integers for scores.`
 }
 
 func trimRunes(s string, max int) string {

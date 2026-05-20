@@ -368,6 +368,27 @@ func initHistoryDB(path string) error {
 			updated_at TEXT NOT NULL,
 			FOREIGN KEY(user_id) REFERENCES users(id)
 		)`,
+		`CREATE TABLE IF NOT EXISTS turn_evaluations (
+			id TEXT PRIMARY KEY,
+			thread_id TEXT NOT NULL,
+			assistant_message_id TEXT,
+			seq INTEGER NOT NULL DEFAULT 0,
+			previous_prediction_json TEXT NOT NULL DEFAULT '{}',
+			actual_behavior_json TEXT NOT NULL DEFAULT '{}',
+			prediction_match_json TEXT NOT NULL DEFAULT '{}',
+			control_score INTEGER NOT NULL DEFAULT 50,
+			behavior_effectiveness INTEGER NOT NULL DEFAULT 50,
+			short_goal_json TEXT NOT NULL DEFAULT '{}',
+			long_goal_json TEXT NOT NULL DEFAULT '{}',
+			interaction_strategy_json TEXT NOT NULL DEFAULT '{}',
+			next_prediction_json TEXT NOT NULL DEFAULT '{}',
+			raw_json TEXT NOT NULL DEFAULT '{}',
+			created_at TEXT NOT NULL,
+			FOREIGN KEY(thread_id) REFERENCES threads(id),
+			FOREIGN KEY(assistant_message_id) REFERENCES messages(id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_turn_eval_thread_seq ON turn_evaluations(thread_id, seq)`,
+		`CREATE INDEX IF NOT EXISTS idx_turn_eval_message ON turn_evaluations(assistant_message_id)`,
 		`CREATE TABLE IF NOT EXISTS environment_states (
 			thread_id TEXT PRIMARY KEY,
 			scene TEXT NOT NULL DEFAULT 'quiet room',
@@ -920,6 +941,10 @@ func loadPromptContext(path string, cfg PEConfig) (PromptContext, error) {
 	if err != nil {
 		return PromptContext{}, err
 	}
+	turnEvaluationContext, err := loadTurnEvaluationContext(db, 6)
+	if err != nil {
+		return PromptContext{}, err
+	}
 	summarization, err := loadShortTermSummarization(db, defaultThreadID)
 	if err != nil {
 		return PromptContext{}, err
@@ -945,17 +970,18 @@ func loadPromptContext(path string, cfg PEConfig) (PromptContext, error) {
 		return PromptContext{}, err
 	}
 	return PromptContext{
-		Config:        cfg,
-		RolePrompt:    rolePrompt,
-		Memories:      memories,
-		MemoryIndex:   memoryIndex,
-		Summarization: summarization,
-		Recent:        recent,
-		RoleState:     roleState,
-		UserProfile:   userProfile,
-		UserContext:   userContext,
-		Environment:   env,
-		Now:           time.Now(),
+		Config:                cfg,
+		RolePrompt:            rolePrompt,
+		Memories:              memories,
+		MemoryIndex:           memoryIndex,
+		Summarization:         summarization,
+		TurnEvaluationContext: turnEvaluationContext,
+		Recent:                recent,
+		RoleState:             roleState,
+		UserProfile:           userProfile,
+		UserContext:           userContext,
+		Environment:           env,
+		Now:                   time.Now(),
 	}, nil
 }
 
@@ -1252,6 +1278,56 @@ func loadEnvironmentState(db *sql.DB) (EnvironmentState, error) {
 	err := db.QueryRow(`SELECT thread_id, scene, surroundings, random_seed, metadata_json, updated_at FROM environment_states WHERE thread_id = ?`, defaultThreadID).Scan(&e.ThreadID, &e.Scene, &e.Surroundings, &e.RandomSeed, &e.MetadataJSON, &updated)
 	e.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
 	return e, err
+}
+
+func loadTurnEvaluationContext(db *sql.DB, limit int) (string, error) {
+	if limit <= 0 {
+		limit = 6
+	}
+	rows, err := db.Query(`
+		SELECT seq, control_score, behavior_effectiveness, prediction_match_json, short_goal_json, long_goal_json, interaction_strategy_json, next_prediction_json, created_at
+		FROM turn_evaluations
+		WHERE thread_id = ?
+		ORDER BY seq DESC, created_at DESC
+		LIMIT ?
+	`, defaultThreadID, limit)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	var reversed []string
+	for rows.Next() {
+		var seq, control, effectiveness int
+		var match, shortGoal, longGoal, strategy, nextPrediction, created string
+		if err := rows.Scan(&seq, &control, &effectiveness, &match, &shortGoal, &longGoal, &strategy, &nextPrediction, &created); err != nil {
+			return "", err
+		}
+		reversed = append(reversed, fmt.Sprintf("- seq=%d control=%d effectiveness=%d match=%s short_goal=%s long_goal=%s strategy=%s next_prediction=%s created_at=%s",
+			seq, control, effectiveness, compactJSON(match, 360), compactJSON(shortGoal, 280), compactJSON(longGoal, 280), compactJSON(strategy, 320), compactJSON(nextPrediction, 320), created))
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	if len(reversed) == 0 {
+		return "No turn evaluations yet. Start the predictive empathy loop by calling evaluate_turn after meaningful replies.", nil
+	}
+	for i, j := 0, len(reversed)-1; i < j; i, j = i+1, j-1 {
+		reversed[i], reversed[j] = reversed[j], reversed[i]
+	}
+	return strings.Join(reversed, "\n"), nil
+}
+
+func compactJSON(src string, max int) string {
+	src = strings.TrimSpace(src)
+	if src == "" {
+		return "{}"
+	}
+	var v any
+	if json.Unmarshal([]byte(src), &v) == nil {
+		raw, _ := json.Marshal(v)
+		src = string(raw)
+	}
+	return trimRunes(src, max)
 }
 
 func savePromptSnapshot(path, messageID string, envelope PromptEnvelope) {

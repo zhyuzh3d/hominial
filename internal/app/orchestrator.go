@@ -54,6 +54,44 @@ func modelVisibleFunctionTools() []map[string]any {
 			},
 			"required": []string{"source", "keywords"},
 		})),
+		functionTool("evaluate_turn", "Append Elli's predictive empathy self-evaluation for this turn and update real-time strategy, control score, goals, and next prediction.", withCallback(map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"previous_prediction": map[string]any{"type": "object"},
+				"actual_user_behavior": map[string]any{
+					"type":        "object",
+					"description": "Observed user behavior. The app fills reply_latency_seconds when it can compute it.",
+				},
+				"prediction_match":       map[string]any{"type": "object"},
+				"control_score":          map[string]any{"type": "integer", "minimum": 0, "maximum": 100},
+				"control_delta":          map[string]any{"type": "integer", "minimum": -100, "maximum": 100},
+				"behavior_effectiveness": map[string]any{"type": "integer", "minimum": 0, "maximum": 100},
+				"short_goal": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"content":        map[string]any{"type": "string"},
+						"distance":       map[string]any{"type": "integer", "minimum": 0, "maximum": 100},
+						"angle":          map[string]any{"type": "integer", "minimum": 0, "maximum": 100},
+						"delta_distance": map[string]any{"type": "integer", "minimum": -100, "maximum": 100},
+						"delta_angle":    map[string]any{"type": "integer", "minimum": -100, "maximum": 100},
+					},
+				},
+				"long_goal": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"content":        map[string]any{"type": "string"},
+						"distance":       map[string]any{"type": "integer", "minimum": 0, "maximum": 100},
+						"angle":          map[string]any{"type": "integer", "minimum": 0, "maximum": 100},
+						"delta_distance": map[string]any{"type": "integer", "minimum": -100, "maximum": 100},
+						"delta_angle":    map[string]any{"type": "integer", "minimum": -100, "maximum": 100},
+					},
+				},
+				"interaction_strategy": map[string]any{"type": "object"},
+				"next_prediction":      map[string]any{"type": "object"},
+				"notes":                map[string]any{"type": "string"},
+			},
+			"required": []string{"actual_user_behavior", "prediction_match", "short_goal", "long_goal", "interaction_strategy", "next_prediction"},
+		})),
 		functionTool("sendmsg", "Send a typed message to user, AI continuation log, internal event stream, or notification stream.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -233,7 +271,7 @@ func runOrchestrator(ctx context.Context, path string, cfg Config, messageID str
 	var out OrchestratorResult
 	var firstErr error
 	for _, call := range calls {
-		result, msg, err := executeToolCall(ctx, db, cfg, call)
+		result, msg, err := executeToolCall(ctx, db, cfg, call, messageID)
 		status := "complete"
 		if err != nil {
 			status = "failed"
@@ -253,7 +291,7 @@ func runOrchestrator(ctx context.Context, path string, cfg Config, messageID str
 			callback, cbOK := callbackFromArguments(call.Arguments)
 			if cbOK && strings.TrimSpace(callback.Tool) != "" {
 				cbCall := callbackToolCall(call, callback, result)
-				cbResult, cbMsg, cbErr := executeToolCall(ctx, db, cfg, cbCall)
+				cbResult, cbMsg, cbErr := executeToolCall(ctx, db, cfg, cbCall, messageID)
 				cbStatus := "complete"
 				if cbErr != nil {
 					cbStatus = "failed"
@@ -275,7 +313,7 @@ func runOrchestrator(ctx context.Context, path string, cfg Config, messageID str
 	return out, firstErr
 }
 
-func executeToolCall(ctx context.Context, db *sql.DB, cfg Config, call ToolCall) (map[string]any, *Message, error) {
+func executeToolCall(ctx context.Context, db *sql.DB, cfg Config, call ToolCall, messageID string) (map[string]any, *Message, error) {
 	args := map[string]any{}
 	if strings.TrimSpace(call.Arguments) != "" {
 		if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
@@ -290,6 +328,8 @@ func executeToolCall(ctx context.Context, db *sql.DB, cfg Config, call ToolCall)
 		return executeMemoryTool(db, args)
 	case "query":
 		return executeQueryTool(db, args)
+	case "evaluate_turn":
+		return executeEvaluateTurnTool(db, args, messageID)
 	case "sendmsg":
 		return executeSendMsgTool(args)
 	case "selfie":
@@ -575,6 +615,168 @@ func executeQueryTool(db *sql.DB, args map[string]any) (map[string]any, *Message
 	}
 }
 
+func executeEvaluateTurnTool(db *sql.DB, args map[string]any, assistantMessageID string) (map[string]any, *Message, error) {
+	now := time.Now().Format(time.RFC3339Nano)
+	roleState, err := loadRoleState(db)
+	if err != nil {
+		return nil, nil, err
+	}
+	userContext, err := loadUserContext(db)
+	if err != nil {
+		return nil, nil, err
+	}
+	previousPrediction := objectArg(args, "previous_prediction")
+	if len(previousPrediction) == 0 {
+		previousPrediction = jsonRawObject(userContext.NextActionPrediction)
+	}
+	actualBehavior := objectArg(args, "actual_user_behavior")
+	if latency, ok := computedReplyLatencySeconds(db, assistantMessageID); ok {
+		actualBehavior["reply_latency_seconds"] = latency
+	}
+	predictionMatch := objectArg(args, "prediction_match")
+	shortGoal := objectArg(args, "short_goal")
+	longGoal := objectArg(args, "long_goal")
+	interactionStrategy := objectArg(args, "interaction_strategy")
+	nextPrediction := objectArg(args, "next_prediction")
+
+	controlScore := roleState.ControlScore
+	if hasArg(args, "control_score") {
+		controlScore = clampInt(intFromAny(args["control_score"], roleState.ControlScore), 0, 100, roleState.ControlScore)
+	} else if hasArg(args, "control_delta") {
+		controlScore = clampInt(roleState.ControlScore+intFromAny(args["control_delta"], 0), 0, 100, roleState.ControlScore)
+	} else if overall, ok := intFromObject(predictionMatch, "overall"); ok {
+		controlScore = clampInt((roleState.ControlScore+overall)/2, 0, 100, roleState.ControlScore)
+	}
+	effectiveness := clampInt(intFromAny(args["behavior_effectiveness"], roleState.BehaviorEffectiveness), 0, 100, roleState.BehaviorEffectiveness)
+
+	seq := 0
+	if strings.TrimSpace(assistantMessageID) != "" {
+		_ = db.QueryRow(`SELECT COALESCE(seq, 0) FROM messages WHERE id = ?`, assistantMessageID).Scan(&seq)
+	}
+	id := newID("eval")
+	prevJSON := jsonObjectString(previousPrediction)
+	actualJSON := jsonObjectString(actualBehavior)
+	matchJSON := jsonObjectString(predictionMatch)
+	shortJSON := jsonObjectString(shortGoal)
+	longJSON := jsonObjectString(longGoal)
+	strategyJSON := jsonObjectString(interactionStrategy)
+	nextJSON := jsonObjectString(nextPrediction)
+	rawJSON := jsonObjectString(args)
+
+	if _, err := db.Exec(`
+		INSERT INTO turn_evaluations(id, thread_id, assistant_message_id, seq, previous_prediction_json, actual_behavior_json,
+			prediction_match_json, control_score, behavior_effectiveness, short_goal_json, long_goal_json,
+			interaction_strategy_json, next_prediction_json, raw_json, created_at)
+		VALUES(?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, id, defaultThreadID, assistantMessageID, seq, prevJSON, actualJSON, matchJSON, controlScore, effectiveness, shortJSON, longJSON, strategyJSON, nextJSON, rawJSON, now); err != nil {
+		return nil, nil, err
+	}
+
+	roleMetadata := jsonRawObject(roleState.MetadataJSON)
+	roleMetadata["current_short_goal"] = shortGoal
+	roleMetadata["current_long_goal"] = longGoal
+	roleMetadata["interaction_strategy"] = interactionStrategy
+	roleMetadata["last_turn_evaluation_id"] = id
+	roleUpdate := map[string]any{
+		"control_score":          controlScore,
+		"behavior_effectiveness": effectiveness,
+		"metadata":               roleMetadata,
+	}
+	if distance, ok := intFromObject(shortGoal, "distance"); ok {
+		roleUpdate["short_goal_closeness"] = clampInt(100-distance, 0, 100, 50)
+	}
+	if angle, ok := intFromObject(shortGoal, "angle"); ok {
+		roleUpdate["short_goal_deviation"] = clampInt(100-angle, 0, 100, 0)
+	}
+	if distance, ok := intFromObject(longGoal, "distance"); ok {
+		roleUpdate["long_goal_closeness"] = clampInt(100-distance, 0, 100, 50)
+	}
+	if angle, ok := intFromObject(longGoal, "angle"); ok {
+		roleUpdate["long_goal_deviation"] = clampInt(100-angle, 0, 100, 0)
+	}
+	if _, _, err := updateRoleState(db, roleUpdate); err != nil {
+		return nil, nil, err
+	}
+
+	evaluation := map[string]any{
+		"id":                     id,
+		"previous_prediction":    previousPrediction,
+		"actual_user_behavior":   actualBehavior,
+		"prediction_match":       predictionMatch,
+		"short_goal":             shortGoal,
+		"long_goal":              longGoal,
+		"interaction_strategy":   interactionStrategy,
+		"next_prediction":        nextPrediction,
+		"control_score":          controlScore,
+		"behavior_effectiveness": effectiveness,
+	}
+	userUpdate := map[string]any{
+		"last_prediction":        prevJSON,
+		"next_action_prediction": nextJSON,
+		"evaluation":             evaluation,
+	}
+	if mood, ok := actualBehavior["mood"].(string); ok {
+		userUpdate["mood"] = mood
+	}
+	if action, ok := actualBehavior["action"].(string); ok {
+		userUpdate["action"] = action
+	}
+	if _, _, err := updateUserContext(db, userUpdate); err != nil {
+		return nil, nil, err
+	}
+	return map[string]any{
+		"id":                     id,
+		"seq":                    seq,
+		"control_score":          controlScore,
+		"behavior_effectiveness": effectiveness,
+		"reply_latency_seconds":  actualBehavior["reply_latency_seconds"],
+	}, nil, nil
+}
+
+func computedReplyLatencySeconds(db *sql.DB, assistantMessageID string) (int, bool) {
+	if strings.TrimSpace(assistantMessageID) == "" {
+		return 0, false
+	}
+	var assistantSeq int
+	if err := db.QueryRow(`SELECT COALESCE(seq, 0) FROM messages WHERE id = ?`, assistantMessageID).Scan(&assistantSeq); err != nil || assistantSeq <= 0 {
+		return 0, false
+	}
+	var userSeq int
+	var userCreated string
+	if err := db.QueryRow(`
+		SELECT COALESCE(seq, 0), created_at
+		FROM messages
+		WHERE thread_id = ? AND role = 'user' AND COALESCE(seq, 0) < ?
+		ORDER BY COALESCE(seq, 0) DESC
+		LIMIT 1
+	`, defaultThreadID, assistantSeq).Scan(&userSeq, &userCreated); err != nil || userSeq <= 0 {
+		return 0, false
+	}
+	var prevAssistantCreated string
+	if err := db.QueryRow(`
+		SELECT created_at
+		FROM messages
+		WHERE thread_id = ? AND role = 'assistant' AND COALESCE(seq, 0) < ?
+		ORDER BY COALESCE(seq, 0) DESC
+		LIMIT 1
+	`, defaultThreadID, userSeq).Scan(&prevAssistantCreated); err != nil {
+		return 0, false
+	}
+	userTime, err := time.Parse(time.RFC3339Nano, userCreated)
+	if err != nil {
+		return 0, false
+	}
+	prevAssistantTime, err := time.Parse(time.RFC3339Nano, prevAssistantCreated)
+	if err != nil {
+		return 0, false
+	}
+	seconds := int(userTime.Sub(prevAssistantTime).Seconds())
+	if seconds < 0 {
+		return 0, false
+	}
+	return seconds, true
+}
+
 func executeSendMsgTool(args map[string]any) (map[string]any, *Message, error) {
 	target := emptyDefault(stringArg(args, "target"), "internal")
 	kind := emptyDefault(stringArg(args, "kind"), "text")
@@ -824,6 +1026,28 @@ func jsonRawArray(src string) []any {
 	return out
 }
 
+func objectArg(args map[string]any, key string) map[string]any {
+	if value, ok := args[key].(map[string]any); ok {
+		return value
+	}
+	if value, ok := args[key]; ok {
+		raw, _ := json.Marshal(value)
+		out := map[string]any{}
+		if json.Unmarshal(raw, &out) == nil {
+			return out
+		}
+	}
+	return map[string]any{}
+}
+
+func intFromObject(obj map[string]any, key string) (int, bool) {
+	value, ok := obj[key]
+	if !ok {
+		return 0, false
+	}
+	return intFromAny(value, 0), true
+}
+
 func defaultSelfieReferences() []string {
 	candidates := []string{
 		"character.png",
@@ -903,7 +1127,7 @@ func executeDueScheduledTools(ctx context.Context, path string, cfg Config, limi
 	for _, item := range due {
 		arguments := mergeScheduledCallback(item.args, item.callback)
 		call := ToolCall{ID: newID("schedcall"), Name: item.tool, Arguments: arguments, Status: "pending"}
-		result, msg, err := executeToolCall(ctx, db, cfg, call)
+		result, msg, err := executeToolCall(ctx, db, cfg, call, "schedule:"+item.id)
 		status := "complete"
 		if err != nil {
 			status = "failed"
@@ -916,7 +1140,7 @@ func executeDueScheduledTools(ctx context.Context, path string, cfg Config, limi
 		if status == "complete" {
 			if callback, ok := callbackFromArguments(call.Arguments); ok && strings.TrimSpace(callback.Tool) != "" {
 				cbCall := callbackToolCall(call, callback, result)
-				cbResult, cbMsg, cbErr := executeToolCall(ctx, db, cfg, cbCall)
+				cbResult, cbMsg, cbErr := executeToolCall(ctx, db, cfg, cbCall, "schedule:"+item.id)
 				cbStatus := "complete"
 				if cbErr != nil {
 					cbStatus = "failed"
