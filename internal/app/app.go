@@ -24,7 +24,7 @@ import (
 	"gioui.org/widget/material"
 )
 
-const appVersion = "0.3.0"
+const appVersion = "0.3.1"
 
 type ChatApp struct {
 	win *gioapp.Window

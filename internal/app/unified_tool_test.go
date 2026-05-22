@@ -213,7 +213,8 @@ func TestComputerToolHelpPermissionsAndContinuationImage(t *testing.T) {
 		t.Fatalf("expected input_image part, got %#v", input)
 	}
 
-	currentComputerBackend = fakeWindowComputerBackend{}
+	windowBackend := &fakeWindowComputerBackend{}
+	currentComputerBackend = windowBackend
 	windowed, msg, err := executeComputerTool(context.Background(), db, map[string]any{
 		"operation":             "observe",
 		"crop_to_window":        true,
@@ -230,6 +231,12 @@ func TestComputerToolHelpPermissionsAndContinuationImage(t *testing.T) {
 	defer os.Remove(windowPath)
 	if windowed["window"] == nil {
 		t.Fatalf("expected window metadata, got %#v", windowed)
+	}
+	if windowBackend.activated != 1 {
+		t.Fatalf("expected window activation before screenshot, got %d", windowBackend.activated)
+	}
+	if windowBackend.screenshotOpts.Width != 30 || windowBackend.screenshotOpts.Height != 40 {
+		t.Fatalf("expected cropped screenshot opts, got %#v", windowBackend.screenshotOpts)
 	}
 	if msg == nil || !strings.Contains(msg.Text, "window") {
 		t.Fatalf("expected user-visible window result message, got %#v", msg)
@@ -259,7 +266,10 @@ func (fakeComputerBackend) Screenshot(context.Context, ComputerScreenshotOptions
 
 func (fakeComputerBackend) Execute(context.Context, []ComputerAction) error { return nil }
 
-type fakeWindowComputerBackend struct{}
+type fakeWindowComputerBackend struct {
+	activated      int
+	screenshotOpts ComputerScreenshotOptions
+}
 
 func (fakeWindowComputerBackend) Name() string { return "fake-window" }
 
@@ -267,7 +277,8 @@ func (fakeWindowComputerBackend) ScreenInfo() (ComputerScreenInfo, error) {
 	return ComputerScreenInfo{Width: 100, Height: 80, Scale: 1}, nil
 }
 
-func (fakeWindowComputerBackend) Screenshot(_ context.Context, opts ComputerScreenshotOptions) (image.Image, ComputerScreenInfo, error) {
+func (b *fakeWindowComputerBackend) Screenshot(_ context.Context, opts ComputerScreenshotOptions) (image.Image, ComputerScreenInfo, error) {
+	b.screenshotOpts = opts
 	w, h := opts.Width, opts.Height
 	if w <= 0 {
 		w = 100
@@ -280,6 +291,11 @@ func (fakeWindowComputerBackend) Screenshot(_ context.Context, opts ComputerScre
 
 func (fakeWindowComputerBackend) LocateWindow(context.Context, ComputerScreenshotOptions) (ComputerWindowInfo, error) {
 	return ComputerWindowInfo{App: "Google Chrome", Title: "WPS Office for Mac", X: 10, Y: 20, Width: 30, Height: 40}, nil
+}
+
+func (b *fakeWindowComputerBackend) ActivateWindow(context.Context, ComputerScreenshotOptions, ComputerWindowInfo) error {
+	b.activated++
+	return nil
 }
 
 func (fakeWindowComputerBackend) Execute(context.Context, []ComputerAction) error { return nil }

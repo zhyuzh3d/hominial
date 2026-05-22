@@ -127,6 +127,10 @@ func modelVisibleFunctionTools() []map[string]any {
 					"type":        "boolean",
 					"description": "For operation=observe or return_screenshot, crop to a matching app window instead of the default fullscreen screenshot.",
 				},
+				"activate_window": map[string]any{
+					"type":        "boolean",
+					"description": "When crop_to_window=true, bring the matching window to the foreground before screenshot. Defaults to true.",
+				},
 				"target_app": map[string]any{
 					"type":        "string",
 					"description": "Application/process name for crop_to_window, e.g. Google Chrome.",

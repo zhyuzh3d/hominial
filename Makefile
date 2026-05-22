@@ -4,6 +4,7 @@ APP_CONTENTS := $(APP_BUNDLE)/Contents
 APP_MACOS := $(APP_CONTENTS)/MacOS
 APP_RESOURCES := $(APP_CONTENTS)/Resources
 APP_CMD := ./cmd/eibanban
+APP_VERSION := 0.3.1
 CODESIGN_IDENTITY ?= $(shell security find-identity -v -p codesigning 2>/dev/null | awk '/Codexide Local Code Signing/ { print $$2; exit }')
 
 .PHONY: build run test clean
@@ -28,9 +29,9 @@ build:
 		'  <key>CFBundlePackageType</key>' \
 		'  <string>APPL</string>' \
 		'  <key>CFBundleShortVersionString</key>' \
-		'  <string>0.3.0</string>' \
+		'  <string>$(APP_VERSION)</string>' \
 		'  <key>CFBundleVersion</key>' \
-		'  <string>0.3.0</string>' \
+		'  <string>$(APP_VERSION)</string>' \
 		'  <key>LSMinimumSystemVersion</key>' \
 		'  <string>12.0</string>' \
 		'  <key>NSHighResolutionCapable</key>' \

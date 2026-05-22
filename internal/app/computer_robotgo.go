@@ -114,6 +114,70 @@ return windowLines
 	return ComputerWindowInfo{}, fmt.Errorf("window not found for app=%q title_contains=%q", targetApp, titleContains)
 }
 
+func (robotGoComputerBackend) ActivateWindow(ctx context.Context, opts ComputerScreenshotOptions, window ComputerWindowInfo) error {
+	if runtime.GOOS != "darwin" {
+		return errors.New("window activation is currently implemented only on macOS")
+	}
+	targetApp := strings.TrimSpace(opts.TargetApp)
+	if targetApp == "" {
+		targetApp = strings.TrimSpace(window.App)
+	}
+	titleContains := strings.TrimSpace(opts.WindowTitleContains)
+	if titleContains == "" {
+		titleContains = strings.TrimSpace(window.Title)
+	}
+	if targetApp == "" && titleContains == "" {
+		return errors.New("target_app or window_title_contains is required for window activation")
+	}
+
+	script := `
+on run argv
+	set targetApp to item 1 of argv
+	set titleContains to item 2 of argv
+	tell application "System Events"
+		repeat with p in application processes
+			set appName to name of p as text
+			set appMatches to false
+			ignoring case
+				if targetApp is "" or appName is targetApp or appName contains targetApp or targetApp contains appName then set appMatches to true
+			end ignoring
+			if appMatches then
+				try
+					set frontmost of p to true
+				end try
+				repeat with w in windows of p
+					set winTitle to ""
+					try
+						set winTitle to name of w as text
+					end try
+					set titleMatches to false
+					ignoring case
+						if titleContains is "" or winTitle contains titleContains then set titleMatches to true
+					end ignoring
+					if titleMatches then
+						try
+							perform action "AXRaise" of w
+						end try
+						try
+							set index of w to 1
+						end try
+						return "ok"
+					end if
+				end repeat
+				if titleContains is "" then return "ok"
+			end if
+		end repeat
+	end tell
+	error "matching window not found"
+end run
+`
+	cmd := exec.CommandContext(ctx, "osascript", "-e", script, targetApp, titleContains)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("window activation failed: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 func (robotGoComputerBackend) Execute(ctx context.Context, actions []ComputerAction) error {
 	for _, action := range actions {
 		if err := ctx.Err(); err != nil {

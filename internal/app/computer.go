@@ -26,6 +26,10 @@ type ComputerWindowLocator interface {
 	LocateWindow(ctx context.Context, opts ComputerScreenshotOptions) (ComputerWindowInfo, error)
 }
 
+type ComputerWindowActivator interface {
+	ActivateWindow(ctx context.Context, opts ComputerScreenshotOptions, window ComputerWindowInfo) error
+}
+
 type ComputerScreenInfo struct {
 	Width         int     `json:"width"`
 	Height        int     `json:"height"`
@@ -43,6 +47,7 @@ type ComputerScreenshotOptions struct {
 	TargetApp           string
 	WindowTitleContains string
 	CropToWindow        bool
+	ActivateWindow      bool
 }
 
 type ComputerWindowInfo struct {
@@ -242,11 +247,12 @@ func computerHelpResult(db *sql.DB) map[string]any {
 		"permission_requirements": computerPermissionDiagnosis(),
 		"operations": []map[string]any{
 			{"operation": "help", "description": "Return this API guide. This is safe and available even when computer use is disabled."},
-			{"operation": "observe", "description": "Capture the desktop screenshot. Pass crop_to_window=true with target_app/window_title_contains to crop a specific app window without changing the default fullscreen behavior. Use callback sendmsg target=ai to continue reasoning from the screenshot."},
+			{"operation": "observe", "description": "Capture the desktop screenshot. Pass crop_to_window=true with target_app/window_title_contains to activate and crop a specific app window without changing the default fullscreen behavior. Use callback sendmsg target=ai to continue reasoning from the screenshot."},
 			{"operation": "act", "description": "Execute up to 10 primitive mouse/keyboard actions. Set return_screenshot=true to observe the result."},
 		},
 		"observe_fields": []map[string]any{
 			{"field": "crop_to_window", "type": "boolean", "description": "When true, locate a matching application window and capture only that window region. Defaults to false."},
+			{"field": "activate_window", "type": "boolean", "description": "When crop_to_window=true, bring the matching window to the foreground before screenshot. Defaults to true."},
 			{"field": "target_app", "type": "string", "description": "Application/process name to match, e.g. Google Chrome or Chrome."},
 			{"field": "window_title_contains", "type": "string", "description": "Case-insensitive substring of the window title, e.g. WPS Office for Mac."},
 			{"field": "x/y/width/height", "type": "integer", "description": "Optional manual screenshot region. Existing fullscreen observe remains unchanged when omitted."},
@@ -272,6 +278,7 @@ func computerHelpResult(db *sql.DB) map[string]any {
 			"observe_window_then_continue": map[string]any{
 				"operation":             "observe",
 				"crop_to_window":        true,
+				"activate_window":       true,
 				"target_app":            "Google Chrome",
 				"window_title_contains": "WPS Office for Mac",
 				"callback":              map[string]any{"tool": "sendmsg", "args": map[string]any{"target": "ai", "kind": "tool_result"}},
@@ -315,6 +322,22 @@ func captureComputerScreenshot(ctx context.Context, opts ComputerScreenshotOptio
 			return "", ComputerScreenInfo{}, nil, err
 		}
 		window = &located
+		if opts.ActivateWindow {
+			activator, ok := currentComputerBackend.(ComputerWindowActivator)
+			if !ok {
+				return "", ComputerScreenInfo{}, nil, errors.New("computer backend does not support window activation")
+			}
+			if err := activator.ActivateWindow(ctx, opts, located); err != nil {
+				return "", ComputerScreenInfo{}, nil, err
+			}
+			time.Sleep(350 * time.Millisecond)
+			relocated, err := locator.LocateWindow(ctx, opts)
+			if err != nil {
+				return "", ComputerScreenInfo{}, nil, err
+			}
+			window = &relocated
+			located = relocated
+		}
 		opts.X = located.X
 		opts.Y = located.Y
 		opts.Width = located.Width
@@ -352,6 +375,7 @@ func screenshotOptionsFromArgs(args map[string]any) ComputerScreenshotOptions {
 		TargetApp:           strings.TrimSpace(stringArg(args, "target_app")),
 		WindowTitleContains: strings.TrimSpace(stringArg(args, "window_title_contains")),
 		CropToWindow:        boolArg(args, "crop_to_window", false),
+		ActivateWindow:      boolArg(args, "activate_window", true),
 	}
 }
 
