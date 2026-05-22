@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"image"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -150,6 +152,105 @@ func TestContinuationFromSendMsgResult(t *testing.T) {
 	if input == nil {
 		t.Fatal("expected continuation API input")
 	}
+}
+
+func TestComputerToolHelpPermissionsAndContinuationImage(t *testing.T) {
+	path, cleanup := testDB(t)
+	defer cleanup()
+	db, err := openHistoryDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	oldBackend := currentComputerBackend
+	currentComputerBackend = fakeComputerBackend{}
+	defer func() { currentComputerBackend = oldBackend }()
+
+	help, _, err := executeComputerTool(context.Background(), db, map[string]any{"operation": "help"})
+	if err != nil {
+		t.Fatalf("computer help: %v", err)
+	}
+	if help["enabled"].(bool) {
+		t.Fatal("computer use should default to disabled")
+	}
+	if _, _, err := executeComputerTool(context.Background(), db, map[string]any{"operation": "observe"}); err == nil {
+		t.Fatal("expected observe to be denied while disabled")
+	}
+	if err := saveAppSetting(db, "runtime_settings", RuntimeSettings{ComputerUseEnabled: true}); err != nil {
+		t.Fatalf("save runtime settings: %v", err)
+	}
+	observed, _, err := executeComputerTool(context.Background(), db, map[string]any{"operation": "observe"})
+	if err != nil {
+		t.Fatalf("computer observe: %v", err)
+	}
+	path, _ = observed["screenshot_path"].(string)
+	if path == "" {
+		t.Fatalf("missing screenshot path: %#v", observed)
+	}
+	defer os.Remove(path)
+	result, _, err := executeSendMsgTool(map[string]any{
+		"target": "ai",
+		"kind":   "tool_result",
+		"images": []any{path},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	continuation, ok := continuationFromToolResult(ToolCall{ID: "call_img", Name: "sendmsg"}, result)
+	if !ok || len(continuation.Images) != 1 {
+		t.Fatalf("expected image continuation, got %#v", continuation)
+	}
+	input := continuationToAPIInput(continuation)
+	parts, _ := input["content"].([]map[string]any)
+	foundImage := false
+	for _, part := range parts {
+		if part["type"] == "input_image" {
+			foundImage = true
+		}
+	}
+	if !foundImage {
+		t.Fatalf("expected input_image part, got %#v", input)
+	}
+
+	currentComputerBackend = failingComputerBackend{}
+	failed, _, err := executeComputerTool(context.Background(), db, map[string]any{"operation": "observe"})
+	if err != nil {
+		t.Fatalf("computer observe failures should be model-visible results, got error: %v", err)
+	}
+	if failed["ok"] != false || failed["diagnosis"] == nil {
+		t.Fatalf("expected structured failure result, got %#v", failed)
+	}
+}
+
+type fakeComputerBackend struct{}
+
+func (fakeComputerBackend) Name() string { return "fake" }
+
+func (fakeComputerBackend) ScreenInfo() (ComputerScreenInfo, error) {
+	return ComputerScreenInfo{Width: 12, Height: 8, Scale: 1}, nil
+}
+
+func (fakeComputerBackend) Screenshot(context.Context, ComputerScreenshotOptions) (image.Image, ComputerScreenInfo, error) {
+	return image.NewRGBA(image.Rect(0, 0, 12, 8)), ComputerScreenInfo{Width: 12, Height: 8, Scale: 1}, nil
+}
+
+func (fakeComputerBackend) Execute(context.Context, []ComputerAction) error { return nil }
+
+type failingComputerBackend struct{}
+
+func (failingComputerBackend) Name() string { return "failing" }
+
+func (failingComputerBackend) ScreenInfo() (ComputerScreenInfo, error) {
+	return ComputerScreenInfo{}, nil
+}
+
+func (failingComputerBackend) Screenshot(context.Context, ComputerScreenshotOptions) (image.Image, ComputerScreenInfo, error) {
+	return nil, ComputerScreenInfo{}, os.ErrPermission
+}
+
+func (failingComputerBackend) Execute(context.Context, []ComputerAction) error {
+	return os.ErrPermission
 }
 
 func TestExecuteDueScheduledTools(t *testing.T) {

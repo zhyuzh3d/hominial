@@ -1288,6 +1288,7 @@ func defaultRuntimeSettings() RuntimeSettings {
 		SummarizeThreshold:    cfg.SummarizeThreshold,
 		DreamTriggerThreshold: 100,
 		DailyMeditateEnabled:  true,
+		ComputerUseEnabled:    false,
 	}
 }
 

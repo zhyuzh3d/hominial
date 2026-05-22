@@ -118,14 +118,19 @@ memories.md                   Seed memory document
 ## Run
 
 ```bash
-go run ./cmd/eibanban
+make build
+make run
 ```
 
 ## Build
 
 ```bash
-go build ./cmd/eibanban
+make build
 ```
+
+The desktop binary is written to `Hominial-Elli`.
+
+On macOS, `make build` also creates `Hominial-Elli.app`. Launch the app bundle and grant Screen Recording plus Accessibility permissions to `Hominial-Elli.app` for computer use.
 
 ## Configuration
 

@@ -13,7 +13,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 )
@@ -101,15 +100,23 @@ func continuationToAPIInput(c ToolContinuation) map[string]any {
 		b.WriteString("\nPayload:\n")
 		b.Write(raw)
 	}
-	if strings.TrimSpace(b.String()) == "" {
+	if strings.TrimSpace(b.String()) == "" && len(c.Images) == 0 {
 		return nil
 	}
+	parts := []map[string]any{{
+		"type": "input_text",
+		"text": b.String(),
+	}}
+	for _, img := range c.Images {
+		dataURL, err := fileDataURL(img)
+		if err != nil {
+			continue
+		}
+		parts = append(parts, map[string]any{"type": "input_image", "image_url": dataURL})
+	}
 	return map[string]any{
-		"role": "user",
-		"content": []map[string]any{{
-			"type": "input_text",
-			"text": b.String(),
-		}},
+		"role":    "user",
+		"content": parts,
 	}
 }
 
@@ -343,8 +350,8 @@ func saveBase64Image(s string) (string, error) {
 		ext = ".webp"
 	}
 	sum := sha1.Sum(data)
-	path := filepath.Join("app_outputs", "images", "response_"+hex.EncodeToString(sum[:8])+ext)
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	path, err := appOutputPath("images", "response_"+hex.EncodeToString(sum[:8])+ext)
+	if err != nil {
 		return "", err
 	}
 	return path, os.WriteFile(path, data, 0644)
@@ -367,8 +374,8 @@ func saveDataURL(s string) (string, error) {
 		return "", err
 	}
 	sum := sha1.Sum(data)
-	path := filepath.Join("app_outputs", "images", "response_"+hex.EncodeToString(sum[:8])+ext)
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	path, err := appOutputPath("images", "response_"+hex.EncodeToString(sum[:8])+ext)
+	if err != nil {
 		return "", err
 	}
 	return path, os.WriteFile(path, data, 0644)

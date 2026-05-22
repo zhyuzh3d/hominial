@@ -268,7 +268,13 @@ func (a *ChatApp) bubbleContent(gtx layout.Context, msg Message, isUser bool) la
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				body := msg.Text
 				if body == "" {
-					body = a.uiText("image_only")
+					if len(msg.ToolCalls) > 0 {
+						body = fmt.Sprintf(a.uiText("tool_call_status_fmt"), toolCallNames(msg.ToolCalls))
+					} else if len(msg.Attachments)+len(msg.Images) > 0 {
+						body = a.uiText("image_only")
+					} else {
+						body = a.uiText("empty_tool_message")
+					}
 				}
 				return a.selectableTextStyled(gtx, "message:"+msg.ID, compactParagraphSpacing(body), uiSp(uiTextBody), rgb(21, 28, 43), false, font.SemiBold, 1.55)
 			}),
@@ -351,6 +357,19 @@ func imageChildren(a *ChatApp, paths []string, sizeDp unit.Dp) []layout.FlexChil
 		}))
 	}
 	return children
+}
+
+func toolCallNames(calls []ToolCall) string {
+	seen := map[string]bool{}
+	var names []string
+	for _, call := range calls {
+		if call.Name == "" || seen[call.Name] {
+			continue
+		}
+		seen[call.Name] = true
+		names = append(names, call.Name)
+	}
+	return strings.Join(names, ", ")
 }
 
 func (a *ChatApp) cachedImageOp(path string) (image.Image, paint.ImageOp, error) {
@@ -961,6 +980,13 @@ func (a *ChatApp) systemAccessSettings(gtx layout.Context) layout.Dimensions {
 		layout.Rigid(a.settingsField(&a.baseURL, a.uiText("base_url"))),
 		layout.Rigid(a.settingsField(&a.model, a.uiText("model"))),
 		layout.Rigid(a.settingsField(&a.apiKey, "API Key")),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return layout.Inset{Top: unit.Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				dims := material.CheckBox(a.th, &a.computerUseEnabled, a.uiText("computer_use_enabled")).Layout(gtx)
+				addHandCursor(gtx, dims.Size)
+				return dims
+			})
+		}),
 	)
 }
 
@@ -1577,6 +1603,8 @@ var enUIStrings = map[string]string{
 	"empty_chat":              "Start a conversation, or attach images and send.",
 	"load_older":              "Load older",
 	"image_only":              "(image only)",
+	"tool_call_status_fmt":    "(using tool: %s)",
+	"empty_tool_message":      "(tool message)",
 	"message_placeholder":     "Message",
 	"image_paths_placeholder": "Image paths, comma separated",
 	"add_image_fmt":           "Add Image (%d)",
@@ -1606,6 +1634,7 @@ var enUIStrings = map[string]string{
 	"habits":                  "Habits",
 	"base_url":                "Base URL",
 	"model":                   "Model",
+	"computer_use_enabled":    "Enable Computer Use",
 	"context_k":               "Context Message Window K",
 	"memory_top_n":            "Memory Top N",
 	"memory_random_m":         "Random Memories M",
@@ -1660,6 +1689,8 @@ var zhUIStrings = map[string]string{
 	"empty_chat":              "开始对话，或附加图片后发送。",
 	"load_older":              "加载更早消息",
 	"image_only":              "(仅图片)",
+	"tool_call_status_fmt":    "(正在使用工具：%s)",
+	"empty_tool_message":      "(工具消息)",
 	"message_placeholder":     "输入消息",
 	"image_paths_placeholder": "图片路径，可用逗号分隔",
 	"add_image_fmt":           "添加图片 (%d)",
@@ -1689,6 +1720,7 @@ var zhUIStrings = map[string]string{
 	"habits":                  "行为习惯",
 	"base_url":                "接入点 Base URL",
 	"model":                   "模型",
+	"computer_use_enabled":    "启用 Computer Use",
 	"context_k":               "上下文消息窗口 K",
 	"memory_top_n":            "记忆 Top N",
 	"memory_random_m":         "随机记忆 M",

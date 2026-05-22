@@ -126,8 +126,10 @@ func convertSVGToPNG(path string) (string, error) {
 		return "", err
 	}
 	sum := sha1.Sum(append([]byte(path), data...))
-	outDir := filepath.Join("app_outputs", "converted")
-	outPath := filepath.Join(outDir, "svg_"+hex.EncodeToString(sum[:8])+".png")
+	outPath, err := appOutputPath("converted", "svg_"+hex.EncodeToString(sum[:8])+".png")
+	if err != nil {
+		return "", err
+	}
 	if _, err := os.Stat(outPath); err == nil {
 		return outPath, nil
 	}
@@ -147,9 +149,6 @@ func convertSVGToPNG(path string) (string, error) {
 	if _, err := os.Stat(produced); err != nil {
 		return "", fmt.Errorf("failed to convert SVG: PNG thumbnail was not produced")
 	}
-	if err := os.MkdirAll(outDir, 0755); err != nil {
-		return "", err
-	}
 	data, err = os.ReadFile(produced)
 	if err != nil {
 		return "", err
@@ -167,8 +166,10 @@ func flattenImageToWhitePNG(path string) (string, error) {
 		return "", err
 	}
 	sum := sha1.Sum(append([]byte(path), data...))
-	outDir := filepath.Join("app_outputs", "prepared")
-	outPath := filepath.Join(outDir, "image_"+hex.EncodeToString(sum[:8])+".png")
+	outPath, err := appOutputPath("prepared", "image_"+hex.EncodeToString(sum[:8])+".png")
+	if err != nil {
+		return "", err
+	}
 	if _, err := os.Stat(outPath); err == nil {
 		return outPath, nil
 	}
@@ -180,9 +181,6 @@ func flattenImageToWhitePNG(path string) (string, error) {
 	dst := image.NewRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
 	draw.Draw(dst, dst.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
 	draw.Draw(dst, dst.Bounds(), src, b.Min, draw.Over)
-	if err := os.MkdirAll(outDir, 0755); err != nil {
-		return "", err
-	}
 	f, err := os.Create(outPath)
 	if err != nil {
 		return "", err

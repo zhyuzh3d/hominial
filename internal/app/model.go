@@ -32,6 +32,7 @@ type RuntimeSettings struct {
 	SummarizeThreshold    int  `json:"summarize_threshold"`
 	DreamTriggerThreshold int  `json:"dream_trigger_threshold"`
 	DailyMeditateEnabled  bool `json:"daily_meditate_enabled"`
+	ComputerUseEnabled    bool `json:"computer_use_enabled"`
 }
 
 type AppearanceSettings struct {
@@ -75,6 +76,7 @@ type ToolCallback struct {
 type ToolContinuation struct {
 	SourceCallID string
 	Text         string
+	Images       []string
 	Payload      map[string]any
 }
 

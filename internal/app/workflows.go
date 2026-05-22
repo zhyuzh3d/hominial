@@ -593,8 +593,8 @@ func backupWorkflowDocument(path string) error {
 		return err
 	}
 	name := strings.ReplaceAll(path, string(filepath.Separator), "__")
-	backup := filepath.Join("app_outputs", "workflow_backups", time.Now().Format("20060102_150405")+"__"+name)
-	if err := os.MkdirAll(filepath.Dir(backup), 0755); err != nil {
+	backup, err := appOutputPath("workflow_backups", time.Now().Format("20060102_150405")+"__"+name)
+	if err != nil {
 		return err
 	}
 	return os.WriteFile(backup, raw, 0644)

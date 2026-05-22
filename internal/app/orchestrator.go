@@ -115,6 +115,43 @@ func modelVisibleFunctionTools() []map[string]any {
 			},
 			"required": []string{"prompt"},
 		})),
+		functionTool("computer", "High-permission desktop observation and primitive mouse/keyboard control. First call operation=help to fetch the detailed API guide. Use callbacks with sendmsg target=ai when you need to continue from a screenshot result.", withCallback(map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"operation": map[string]any{"type": "string", "enum": []string{"help", "observe", "act"}},
+				"x":         map[string]any{"type": "integer"},
+				"y":         map[string]any{"type": "integer"},
+				"width":     map[string]any{"type": "integer", "minimum": 1},
+				"height":    map[string]any{"type": "integer", "minimum": 1},
+				"return_screenshot": map[string]any{
+					"type":        "boolean",
+					"description": "For operation=act, capture and return a screenshot after the action sequence. Defaults to true.",
+				},
+				"actions": map[string]any{
+					"type":        "array",
+					"maxItems":    maxComputerActions,
+					"description": "Primitive actions. Call operation=help for detailed field semantics.",
+					"items": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"type":      map[string]any{"type": "string", "enum": []string{"move", "click", "right_click", "double_click", "key", "hotkey", "key_down", "key_up", "type", "wait", "scroll"}},
+							"x":         map[string]any{"type": "integer"},
+							"y":         map[string]any{"type": "integer"},
+							"button":    map[string]any{"type": "string", "enum": []string{"left", "right", "middle"}},
+							"double":    map[string]any{"type": "boolean"},
+							"key":       map[string]any{"type": "string"},
+							"modifiers": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+							"text":      map[string]any{"type": "string"},
+							"ms":        map[string]any{"type": "integer", "minimum": 0, "maximum": 5000},
+							"dx":        map[string]any{"type": "integer"},
+							"dy":        map[string]any{"type": "integer"},
+						},
+						"required": []string{"type"},
+					},
+				},
+			},
+			"required": []string{"operation"},
+		})),
 		functionTool("notify", "Create immediate or scheduled user notifications.", withCallback(map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -334,6 +371,8 @@ func executeToolCall(ctx context.Context, db *sql.DB, cfg Config, call ToolCall,
 		return executeSendMsgTool(args)
 	case "selfie":
 		return executeSelfieTool(ctx, db, cfg, args)
+	case "computer":
+		return executeComputerTool(ctx, db, args)
 	case "notify":
 		return executeNotifyTool(db, args)
 	case "schedule":
@@ -846,6 +885,9 @@ func executeScheduleTool(db *sql.DB, args map[string]any) (map[string]any, *Mess
 		if toolName == "" {
 			return nil, nil, fmt.Errorf("tool is required")
 		}
+		if toolName == "computer" {
+			return nil, nil, fmt.Errorf("computer tool calls cannot be scheduled")
+		}
 		toolArgs, _ := json.Marshal(args["args"])
 		toolCallback, _ := json.Marshal(args["tool_callback"])
 		_, err := db.Exec(`
@@ -938,6 +980,16 @@ func callbackToolCall(parent ToolCall, callback ToolCallback, result map[string]
 				if _, hasKind := args["kind"]; !hasKind {
 					args["kind"] = "image"
 				}
+			} else if imgs := stringSlice(result["images"]); len(imgs) > 0 {
+				args["images"] = imgs
+				if _, hasKind := args["kind"]; !hasKind {
+					args["kind"] = "image"
+				}
+			} else if screenshot, _ := result["screenshot_path"].(string); strings.TrimSpace(screenshot) != "" {
+				args["images"] = []string{screenshot}
+				if _, hasKind := args["kind"]; !hasKind {
+					args["kind"] = "image"
+				}
 			}
 		}
 	}
@@ -959,13 +1011,15 @@ func continuationFromToolResult(call ToolCall, result map[string]any) (ToolConti
 		return ToolContinuation{}, false
 	}
 	text, _ := result["text"].(string)
+	images := stringSlice(result["images"])
 	payload, _ := result["payload"].(map[string]any)
-	if strings.TrimSpace(text) == "" && len(payload) == 0 {
+	if strings.TrimSpace(text) == "" && len(payload) == 0 && len(images) == 0 {
 		return ToolContinuation{}, false
 	}
 	return ToolContinuation{
 		SourceCallID: call.ID,
 		Text:         text,
+		Images:       images,
 		Payload:      payload,
 	}, true
 }
@@ -1132,6 +1186,11 @@ func executeDueScheduledTools(ctx context.Context, path string, cfg Config, limi
 	for _, item := range due {
 		arguments := mergeScheduledCallback(item.args, item.callback)
 		call := ToolCall{ID: newID("schedcall"), Name: item.tool, Arguments: arguments, Status: "pending"}
+		if item.tool == "computer" {
+			logToolCall(db, "schedule:"+item.id, call, map[string]any{"error": "computer tool calls cannot be scheduled"}, "failed")
+			_, _ = db.Exec(`UPDATE scheduled_tool_calls SET status = ?, last_run_at = ?, updated_at = ? WHERE id = ?`, "paused", now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), item.id)
+			continue
+		}
 		result, msg, err := executeToolCall(ctx, db, cfg, call, "schedule:"+item.id)
 		status := "complete"
 		if err != nil {

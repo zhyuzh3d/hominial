@@ -24,7 +24,7 @@ import (
 	"gioui.org/widget/material"
 )
 
-const appVersion = "0.2.2"
+const appVersion = "0.3.0"
 
 type ChatApp struct {
 	win *gioapp.Window
@@ -114,6 +114,7 @@ type ChatApp struct {
 	summarizeThreshold    widget.Editor
 	dreamTriggerThreshold widget.Editor
 	dailyMeditate         widget.Bool
+	computerUseEnabled    widget.Bool
 	summarizePrompt       widget.Editor
 	dreamPrompt           widget.Editor
 	meditatePrompt        widget.Editor
@@ -603,6 +604,7 @@ func (a *ChatApp) applySettingsToEditors(settings UISettings) {
 	a.summarizeThreshold.SetText(strconv.Itoa(runtime.SummarizeThreshold))
 	a.dreamTriggerThreshold.SetText(strconv.Itoa(runtime.DreamTriggerThreshold))
 	a.dailyMeditate.Value = runtime.DailyMeditateEnabled
+	a.computerUseEnabled.Value = runtime.ComputerUseEnabled
 	prompts := loadPromptEditorTexts()
 	a.summarizePrompt.SetText(prompts["summarize"])
 	a.dreamPrompt.SetText(prompts["dream"])
@@ -666,6 +668,7 @@ func (a *ChatApp) collectSettingsFromEditors() UISettings {
 			SummarizeThreshold:    intEditorValue(&a.summarizeThreshold, defaultRuntimeSettings().SummarizeThreshold),
 			DreamTriggerThreshold: intEditorValue(&a.dreamTriggerThreshold, defaultRuntimeSettings().DreamTriggerThreshold),
 			DailyMeditateEnabled:  a.dailyMeditate.Value,
+			ComputerUseEnabled:    a.computerUseEnabled.Value,
 		},
 		Appearance: appearance,
 	}

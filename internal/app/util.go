@@ -1,6 +1,7 @@
 package app
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,6 +43,25 @@ func expandPath(path string) string {
 		return filepath.Join(home, path[2:])
 	}
 	return path
+}
+
+func appOutputPath(parts ...string) (string, error) {
+	local := filepath.Join(append([]string{"app_outputs"}, parts...)...)
+	if err := os.MkdirAll(filepath.Dir(local), 0755); err == nil {
+		return local, nil
+	}
+	base, err := os.UserCacheDir()
+	if err != nil {
+		base, err = os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("output directory unavailable: %w", err)
+		}
+	}
+	path := filepath.Join(append([]string{base, "Hominial-Elli", "app_outputs"}, parts...)...)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func trimForStatus(b []byte) string {
