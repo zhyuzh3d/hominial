@@ -13,7 +13,7 @@ import (
 )
 
 func maybeRefreshShortSummarization(ctx context.Context, cfg Config, path string, peCfg PEConfig) error {
-	db, err := openHistoryDB(path)
+	db, err := openInitializedHistoryDB(path)
 	if err != nil {
 		return err
 	}
@@ -26,7 +26,11 @@ func maybeRefreshShortSummarization(ctx context.Context, cfg Config, path string
 	if err := db.QueryRow(`SELECT COALESCE(MAX(seq), 0), COUNT(*) FROM messages WHERE thread_id = ? AND deleted_at IS NULL`, defaultThreadID).Scan(&maxSeq, &count); err != nil {
 		return err
 	}
-	oldestUncompressedSeq := maxSeq - peCfg.RecentMessagesK
+	threshold := peCfg.SummarizeThreshold
+	if threshold <= 0 {
+		threshold = peCfg.RecentMessagesK
+	}
+	oldestUncompressedSeq := maxSeq - threshold
 	if oldestUncompressedSeq <= 0 || oldestUncompressedSeq <= summarization.UpToSeq || oldestUncompressedSeq-summarization.UpToSeq < peCfg.SummarizeEvery {
 		return nil
 	}

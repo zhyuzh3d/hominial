@@ -13,6 +13,7 @@ func buildPrompt(ctx PromptContext) (PromptEnvelope, error) {
 	}
 	sections := map[string]string{}
 	sections["role"] = trimRunes(strings.TrimSpace(ctx.RolePrompt), cfg.MaxRoleChars)
+	sections["companion_profile"] = formatCompanionProfile(ctx.CompanionProfile)
 	sections["memory"] = formatMemories(ctx.Memories, cfg.MaxSectionChars)
 	sections["memory_index"] = trimRunes(ctx.MemoryIndex, cfg.MaxSectionChars/2)
 	sections["summarization"] = trimRunes(ctx.Summarization.Content, cfg.MaxSectionChars)
@@ -87,6 +88,7 @@ func composeSystemPrompt(sections map[string]string, maxChars int) string {
 		title string
 	}{
 		{"role", "Role Setting"},
+		{"companion_profile", "Companion Profile"},
 		{"memory_index", "Memory Categories And Tags"},
 		{"memory", "Long-Term Memory Recall"},
 		{"summarization", "Short-Term Memory Summarization"},
@@ -147,6 +149,26 @@ metadata=%s`, emptyDefault(s.Health, "stable"), emptyDefault(s.Mental, "clear"),
 
 func formatUserProfile(p UserProfile) string {
 	return fmt.Sprintf("user_set_profile=%s\ncharacter_estimated_profile=%s", emptyDefault(p.SetJSON, "{}"), emptyDefault(p.EstimatedJSON, "{}"))
+}
+
+func formatCompanionProfile(p ProfileSettings) string {
+	lines := []string{}
+	add := func(key, value string) {
+		if strings.TrimSpace(value) != "" {
+			lines = append(lines, fmt.Sprintf("%s=%s", key, strings.TrimSpace(value)))
+		}
+	}
+	add("full_name", p.FullName)
+	add("nickname", p.Nickname)
+	add("avatar", p.Avatar)
+	add("canon_image", p.CanonImage)
+	add("gender", p.Gender)
+	add("birth_date", p.BirthDate)
+	add("description", p.Description)
+	add("story", p.Story)
+	add("personality", p.Personality)
+	add("habits", p.Habits)
+	return strings.Join(lines, "\n")
 }
 
 func formatUserContext(c UserContext) string {

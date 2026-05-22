@@ -19,4 +19,3 @@ Return JSON with:
 - `notes`: audit notes
 
 Do not edit source code, database schema, API keys, user-set profile, or locked user-owned settings.
-

@@ -96,12 +96,6 @@ func loadRecentMessages(path, threadID string, limit int) ([]Message, bool, erro
 		if m.CreatedAt.IsZero() {
 			m.CreatedAt = time.Now()
 		}
-		attachments, images, err := loadMessageAttachments(db, m.ID)
-		if err != nil {
-			return nil, false, err
-		}
-		m.Attachments = attachments
-		m.Images = images
 		reversed = append(reversed, m)
 	}
 	if err := rows.Err(); err != nil {
@@ -113,6 +107,9 @@ func loadRecentMessages(path, threadID string, limit int) ([]Message, bool, erro
 	}
 	for i, j := 0, len(reversed)-1; i < j; i, j = i+1, j-1 {
 		reversed[i], reversed[j] = reversed[j], reversed[i]
+	}
+	if err := loadAttachmentsForMessages(db, reversed); err != nil {
+		return nil, false, err
 	}
 	return reversed, hasOlder, nil
 }
@@ -151,12 +148,6 @@ func loadOlderMessages(path, threadID string, beforeSeq, limit int) ([]Message, 
 		if m.CreatedAt.IsZero() {
 			m.CreatedAt = time.Now()
 		}
-		attachments, images, err := loadMessageAttachments(db, m.ID)
-		if err != nil {
-			return nil, false, err
-		}
-		m.Attachments = attachments
-		m.Images = images
 		reversed = append(reversed, m)
 	}
 	if err := rows.Err(); err != nil {
@@ -168,6 +159,9 @@ func loadOlderMessages(path, threadID string, beforeSeq, limit int) ([]Message, 
 	}
 	for i, j := 0, len(reversed)-1; i < j; i, j = i+1, j-1 {
 		reversed[i], reversed[j] = reversed[j], reversed[i]
+	}
+	if err := loadAttachmentsForMessages(db, reversed); err != nil {
+		return nil, false, err
 	}
 	return reversed, hasOlder, nil
 }
@@ -201,6 +195,13 @@ func openHistoryDB(path string) (*sql.DB, error) {
 		return nil, err
 	}
 	return sql.Open("sqlite", path+"?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+}
+
+func openInitializedHistoryDB(path string) (*sql.DB, error) {
+	if err := initHistoryDB(path); err != nil {
+		return nil, err
+	}
+	return openHistoryDB(path)
 }
 
 func initHistoryDB(path string) error {
@@ -259,8 +260,9 @@ func initHistoryDB(path string) error {
 			deleted_at TEXT,
 			FOREIGN KEY(thread_id) REFERENCES threads(id),
 			FOREIGN KEY(parent_message_id) REFERENCES messages(id)
-		)`,
+			)`,
 		`CREATE INDEX IF NOT EXISTS idx_messages_thread_seq ON messages(thread_id, seq)`,
+		`CREATE INDEX IF NOT EXISTS idx_messages_thread_live_seq ON messages(thread_id, deleted_at, seq)`,
 		`CREATE TABLE IF NOT EXISTS attachments (
 			id TEXT PRIMARY KEY,
 			message_id TEXT NOT NULL,
@@ -322,8 +324,6 @@ func initHistoryDB(path string) error {
 			FOREIGN KEY(user_id) REFERENCES users(id)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_ltm_agent_score ON long_term_memories(agent_id, rank, recall_count, updated_at)`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_ltm_model_id ON long_term_memories(model_id) WHERE model_id IS NOT NULL`,
-		`CREATE INDEX IF NOT EXISTS idx_ltm_category ON long_term_memories(agent_id, category, status)`,
 		`CREATE TABLE IF NOT EXISTS short_term_summarizations (
 			thread_id TEXT PRIMARY KEY,
 			content TEXT NOT NULL DEFAULT '',
@@ -397,6 +397,11 @@ func initHistoryDB(path string) error {
 			metadata_json TEXT NOT NULL DEFAULT '{}',
 			updated_at TEXT NOT NULL,
 			FOREIGN KEY(thread_id) REFERENCES threads(id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS app_settings (
+			key TEXT PRIMARY KEY,
+			value_json TEXT NOT NULL DEFAULT '{}',
+			updated_at TEXT NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS orchestrator_events (
 			id TEXT PRIMARY KEY,
@@ -651,6 +656,317 @@ func backfillMemoryModelIDs(db *sql.DB) error {
 	return nil
 }
 
+func loadUISettings(path string, cfg Config) (UISettings, error) {
+	if err := initHistoryDB(path); err != nil {
+		return UISettings{}, err
+	}
+	db, err := openHistoryDB(path)
+	if err != nil {
+		return UISettings{}, err
+	}
+	defer db.Close()
+	settings := UISettings{System: cfg, Runtime: defaultRuntimeSettings()}
+	var setJSON string
+	if err := db.QueryRow(`SELECT set_json FROM user_profiles WHERE user_id = ?`, defaultUserID).Scan(&setJSON); err == nil {
+		_ = json.Unmarshal([]byte(emptyDefault(setJSON, "{}")), &settings.User)
+	}
+	var companion ProfileSettings
+	if err := loadAppSetting(db, "companion_profile", &companion); err == nil {
+		settings.Companion = companion
+	}
+	var system Config
+	if err := loadAppSetting(db, "system_access", &system); err == nil {
+		if strings.TrimSpace(system.BaseURL) != "" {
+			settings.System.BaseURL = system.BaseURL
+		}
+		if strings.TrimSpace(system.Model) != "" {
+			settings.System.Model = system.Model
+		}
+		if strings.TrimSpace(system.APIKey) != "" {
+			settings.System.APIKey = system.APIKey
+		}
+	}
+	var runtime RuntimeSettings
+	if err := loadAppSetting(db, "runtime_settings", &runtime); err == nil {
+		settings.Runtime = normalizeRuntimeSettings(runtime)
+	}
+	var appearance AppearanceSettings
+	if err := loadAppSetting(db, "appearance_settings", &appearance); err == nil {
+		settings.Appearance = normalizeAppearanceSettings(appearance)
+	} else {
+		settings.Appearance = normalizeAppearanceSettings(settings.Appearance)
+	}
+	return settings, nil
+}
+
+func saveUISettings(path string, settings UISettings) error {
+	if err := initHistoryDB(path); err != nil {
+		return err
+	}
+	db, err := openHistoryDB(path)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	now := time.Now().Format(time.RFC3339Nano)
+	userJSON, err := json.Marshal(settings.User)
+	if err != nil {
+		return err
+	}
+	if _, err := db.Exec(`UPDATE user_profiles SET set_json = ?, updated_at = ? WHERE user_id = ?`, string(userJSON), now, defaultUserID); err != nil {
+		return err
+	}
+	if err := saveAppSetting(db, "companion_profile", settings.Companion); err != nil {
+		return err
+	}
+	if err := saveAppSetting(db, "system_access", settings.System); err != nil {
+		return err
+	}
+	settings.Runtime = normalizeRuntimeSettings(settings.Runtime)
+	if err := saveAppSetting(db, "runtime_settings", settings.Runtime); err != nil {
+		return err
+	}
+	settings.Appearance = normalizeAppearanceSettings(settings.Appearance)
+	if err := saveAppSetting(db, "appearance_settings", settings.Appearance); err != nil {
+		return err
+	}
+	return applyRuntimeSchedules(db, settings.Runtime)
+}
+
+func loadCompanionProfile(db *sql.DB) ProfileSettings {
+	var p ProfileSettings
+	_ = loadAppSetting(db, "companion_profile", &p)
+	return p
+}
+
+func loadAppSetting(db *sql.DB, key string, dest any) error {
+	var raw string
+	if err := db.QueryRow(`SELECT value_json FROM app_settings WHERE key = ?`, key).Scan(&raw); err != nil {
+		return err
+	}
+	return json.Unmarshal([]byte(emptyDefault(raw, "{}")), dest)
+}
+
+func saveAppSetting(db *sql.DB, key string, value any) error {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	now := time.Now().Format(time.RFC3339Nano)
+	_, err = db.Exec(`
+		INSERT INTO app_settings(key, value_json, updated_at)
+		VALUES(?, ?, ?)
+		ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
+	`, key, string(raw), now)
+	return err
+}
+
+func normalizeRuntimeSettings(settings RuntimeSettings) RuntimeSettings {
+	def := defaultRuntimeSettings()
+	if settings.ContextMessagesK <= 0 {
+		settings.ContextMessagesK = def.ContextMessagesK
+	}
+	if settings.MemoryTopN < 0 {
+		settings.MemoryTopN = def.MemoryTopN
+	}
+	if settings.MemoryRandomM < 0 {
+		settings.MemoryRandomM = def.MemoryRandomM
+	}
+	if settings.SummarizeThreshold <= 0 {
+		settings.SummarizeThreshold = def.SummarizeThreshold
+	}
+	if settings.DreamTriggerThreshold <= 0 {
+		settings.DreamTriggerThreshold = def.DreamTriggerThreshold
+	}
+	return settings
+}
+
+func applyRuntimeSchedules(db *sql.DB, settings RuntimeSettings) error {
+	settings = normalizeRuntimeSettings(settings)
+	now := time.Now().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`
+		UPDATE scheduled_tool_calls
+		SET arguments_json = ?, updated_at = ?
+		WHERE id = 'default_dream_hourly'
+	`, fmt.Sprintf(`{"operation":"check","threshold":%d}`, settings.DreamTriggerThreshold), now); err != nil {
+		return err
+	}
+	meditateStatus := "paused"
+	if settings.DailyMeditateEnabled {
+		meditateStatus = "active"
+	}
+	_, err := db.Exec(`UPDATE scheduled_tool_calls SET status = ?, updated_at = ? WHERE id = 'default_meditate_daily'`, meditateStatus, now)
+	return err
+}
+
+func loadPromptEditorTexts() map[string]string {
+	return map[string]string{
+		"summarize": readTextDefault("prompts/summarize_prompt.md", ""),
+		"dream":     readTextDefault("prompts/dream_prompt.md", ""),
+		"meditate":  readTextDefault("prompts/meditate_prompt.md", ""),
+	}
+}
+
+func savePromptEditorTexts(prompts map[string]string) error {
+	paths := map[string]string{
+		"summarize": "prompts/summarize_prompt.md",
+		"dream":     "prompts/dream_prompt.md",
+		"meditate":  "prompts/meditate_prompt.md",
+	}
+	for key, path := range paths {
+		text, ok := prompts[key]
+		if !ok {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(path, []byte(strings.TrimSpace(text)+"\n"), 0644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func loadWorkflowLogs(path string, limit int) ([]WorkflowLog, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	db, err := openInitializedHistoryDB(path)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	rows, err := db.Query(`
+		SELECT id, function_name, arguments_json, COALESCE(result_json, ''), status, created_at
+		FROM orchestrator_events
+		WHERE function_name IN ('summarize.workflow', 'dream.workflow', 'meditate.workflow')
+		ORDER BY created_at DESC
+		LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var logs []WorkflowLog
+	for rows.Next() {
+		var log WorkflowLog
+		var created string
+		if err := rows.Scan(&log.ID, &log.Name, &log.Arguments, &log.Result, &log.Status, &created); err != nil {
+			return nil, err
+		}
+		log.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		logs = append(logs, log)
+	}
+	return logs, rows.Err()
+}
+
+func loadMemoryEntries(path, mode string, limit int) ([]LongTermMemory, error) {
+	db, err := openInitializedHistoryDB(path)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	filter := ""
+	if mode == "knowledge" {
+		filter = "AND (category = 'knowledge' OR tags_json LIKE '%knowledge%' OR tags_json LIKE '%知识%')"
+	} else {
+		filter = "AND category != 'knowledge'"
+	}
+	query := `
+		SELECT id, model_id, content, category, tags_json, rank, confidence, recall_count, recalled_count, used_count, last_recalled_at, last_used_at, source_message_id, status, created_at, updated_at
+		FROM long_term_memories
+		WHERE agent_id = ? AND deleted_at IS NULL ` + filter + `
+		ORDER BY status = 'active' DESC, rank DESC, updated_at DESC
+	`
+	args := []any{defaultAgentID}
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var entries []LongTermMemory
+	for rows.Next() {
+		var m LongTermMemory
+		var last, lastUsed, sourceMessage, created, updated sql.NullString
+		if err := rows.Scan(&m.ID, &m.ModelID, &m.Content, &m.Category, &m.TagsJSON, &m.Rank, &m.Confidence, &m.RecallCount, &m.RecalledCount, &m.UsedCount, &last, &lastUsed, &sourceMessage, &m.Status, &created, &updated); err != nil {
+			return nil, err
+		}
+		m.LastRecalledAt, _ = time.Parse(time.RFC3339Nano, last.String)
+		m.LastUsedAt, _ = time.Parse(time.RFC3339Nano, lastUsed.String)
+		m.SourceMessageID = sourceMessage.String
+		m.CreatedAt, _ = time.Parse(time.RFC3339Nano, created.String)
+		m.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated.String)
+		entries = append(entries, m)
+	}
+	return entries, rows.Err()
+}
+
+func saveMemoryEntry(path, mode string, entry LongTermMemory) (int, error) {
+	db, err := openInitializedHistoryDB(path)
+	if err != nil {
+		return 0, err
+	}
+	defer db.Close()
+	now := time.Now().Format(time.RFC3339Nano)
+	if strings.TrimSpace(entry.Content) == "" {
+		return 0, fmt.Errorf("content is required")
+	}
+	if mode == "knowledge" && strings.TrimSpace(entry.Category) == "" {
+		entry.Category = "knowledge"
+	}
+	if strings.TrimSpace(entry.TagsJSON) == "" {
+		entry.TagsJSON = "[]"
+	}
+	if entry.Rank < 0 {
+		entry.Rank = 0
+	}
+	if entry.Rank > 10 {
+		entry.Rank = 10
+	}
+	if entry.Confidence < 0 {
+		entry.Confidence = 0
+	}
+	if entry.Confidence > 100 {
+		entry.Confidence = 100
+	}
+	if strings.TrimSpace(entry.Status) == "" {
+		entry.Status = "active"
+	}
+	if entry.ModelID <= 0 {
+		modelID, err := nextMemoryModelID(db)
+		if err != nil {
+			return 0, err
+		}
+		_, err = db.Exec(`
+			INSERT INTO long_term_memories(id, model_id, agent_id, user_id, content, category, tags_json, rank, confidence, source, status, created_at, updated_at)
+			VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'settings', ?, ?, ?)
+		`, newID("mem"), modelID, defaultAgentID, defaultUserID, entry.Content, entry.Category, entry.TagsJSON, entry.Rank, entry.Confidence, entry.Status, now, now)
+		return modelID, err
+	}
+	_, err = db.Exec(`
+		UPDATE long_term_memories
+		SET content = ?, category = ?, tags_json = ?, rank = ?, confidence = ?, status = ?, updated_at = ?, deleted_at = NULL
+		WHERE model_id = ? AND agent_id = ?
+	`, entry.Content, entry.Category, entry.TagsJSON, entry.Rank, entry.Confidence, entry.Status, now, entry.ModelID, defaultAgentID)
+	return entry.ModelID, err
+}
+
+func archiveMemoryEntry(path string, modelID int) error {
+	db, err := openInitializedHistoryDB(path)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	now := time.Now().Format(time.RFC3339Nano)
+	_, err = db.Exec(`UPDATE long_term_memories SET status = 'archived', deleted_at = ?, updated_at = ? WHERE model_id = ? AND agent_id = ?`, now, now, modelID, defaultAgentID)
+	return err
+}
+
 func loadMessageAttachments(db *sql.DB, messageID string) ([]string, []string, error) {
 	rows, err := db.Query(`
 		SELECT kind, path
@@ -676,6 +992,53 @@ func loadMessageAttachments(db *sql.DB, messageID string) ([]string, []string, e
 		}
 	}
 	return attachments, images, rows.Err()
+}
+
+func loadAttachmentsForMessages(db *sql.DB, messages []Message) error {
+	if len(messages) == 0 {
+		return nil
+	}
+	placeholders := make([]string, 0, len(messages))
+	args := make([]any, 0, len(messages))
+	indexByID := make(map[string]int, len(messages))
+	for i := range messages {
+		if messages[i].ID == "" {
+			continue
+		}
+		indexByID[messages[i].ID] = i
+		placeholders = append(placeholders, "?")
+		args = append(args, messages[i].ID)
+	}
+	if len(args) == 0 {
+		return nil
+	}
+	rows, err := db.Query(`
+		SELECT message_id, kind, path
+		FROM attachments
+		WHERE message_id IN (`+strings.Join(placeholders, ",")+`)
+		ORDER BY message_id, created_at, id
+	`, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var messageID, kind, path string
+		if err := rows.Scan(&messageID, &kind, &path); err != nil {
+			return err
+		}
+		idx, ok := indexByID[messageID]
+		if !ok {
+			continue
+		}
+		switch kind {
+		case "assistant_image", "generated_image", "output_image":
+			messages[idx].Images = append(messages[idx].Images, path)
+		default:
+			messages[idx].Attachments = append(messages[idx].Attachments, path)
+		}
+	}
+	return rows.Err()
 }
 
 func saveHistoryDB(path string, messages []Message, allowEmpty bool) error {
@@ -907,12 +1270,42 @@ func defaultPEConfig() PEConfig {
 		LongMemoryRandomM:     5,
 		RecentMessagesK:       40,
 		MessageWindowSize:     defaultWindowSize,
+		SummarizeThreshold:    40,
 		MaxPromptChars:        24000,
 		MaxRoleChars:          2000,
 		MaxSectionChars:       5000,
 		SummarizeEvery:        20,
 		ReferenceImageTimeout: 10 * time.Minute,
 	}
+}
+
+func defaultRuntimeSettings() RuntimeSettings {
+	cfg := defaultPEConfig()
+	return RuntimeSettings{
+		ContextMessagesK:      cfg.RecentMessagesK,
+		MemoryTopN:            cfg.LongMemoryTopN,
+		MemoryRandomM:         cfg.LongMemoryRandomM,
+		SummarizeThreshold:    cfg.SummarizeThreshold,
+		DreamTriggerThreshold: 100,
+		DailyMeditateEnabled:  true,
+	}
+}
+
+func peConfigFromRuntime(settings RuntimeSettings) PEConfig {
+	cfg := defaultPEConfig()
+	if settings.ContextMessagesK > 0 {
+		cfg.RecentMessagesK = settings.ContextMessagesK
+	}
+	if settings.MemoryTopN >= 0 {
+		cfg.LongMemoryTopN = settings.MemoryTopN
+	}
+	if settings.MemoryRandomM >= 0 {
+		cfg.LongMemoryRandomM = settings.MemoryRandomM
+	}
+	if settings.SummarizeThreshold > 0 {
+		cfg.SummarizeThreshold = settings.SummarizeThreshold
+	}
+	return cfg
 }
 
 func loadPromptContext(path string, cfg PEConfig) (PromptContext, error) {
@@ -972,6 +1365,7 @@ func loadPromptContext(path string, cfg PEConfig) (PromptContext, error) {
 	return PromptContext{
 		Config:                cfg,
 		RolePrompt:            rolePrompt,
+		CompanionProfile:      loadCompanionProfile(db),
 		Memories:              memories,
 		MemoryIndex:           memoryIndex,
 		Summarization:         summarization,
@@ -1224,12 +1618,6 @@ func loadRecentMessagesFromDB(db *sql.DB, threadID string, limit int) ([]Message
 			return nil, err
 		}
 		m.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
-		attachments, images, err := loadMessageAttachments(db, m.ID)
-		if err != nil {
-			return nil, err
-		}
-		m.Attachments = attachments
-		m.Images = images
 		reversed = append(reversed, m)
 	}
 	if err := rows.Err(); err != nil {
@@ -1237,6 +1625,9 @@ func loadRecentMessagesFromDB(db *sql.DB, threadID string, limit int) ([]Message
 	}
 	for i, j := 0, len(reversed)-1; i < j; i, j = i+1, j-1 {
 		reversed[i], reversed[j] = reversed[j], reversed[i]
+	}
+	if err := loadAttachmentsForMessages(db, reversed); err != nil {
+		return nil, err
 	}
 	return reversed, nil
 }
@@ -1331,7 +1722,7 @@ func compactJSON(src string, max int) string {
 }
 
 func savePromptSnapshot(path, messageID string, envelope PromptEnvelope) {
-	db, err := openHistoryDB(path)
+	db, err := openInitializedHistoryDB(path)
 	if err != nil {
 		return
 	}

@@ -60,15 +60,25 @@ func (a *ChatApp) previewToolbar(gtx layout.Context, filename string) layout.Dim
 				return layout.Flex{Axis: layout.Vertical, Alignment: layout.Middle}.Layout(gtx,
 					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 						return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
-							layout.Rigid(material.Button(a.th, &a.zoomOutBtn, "Zoom Out").Layout),
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								return a.actionButton(gtx, &a.zoomOutBtn, "Zoom Out")
+							}),
 							layout.Rigid(func(gtx layout.Context) layout.Dimensions { return layout.Spacer{Width: unit.Dp(8)}.Layout(gtx) }),
-							layout.Rigid(material.Button(a.th, &a.zoomInBtn, "Zoom In").Layout),
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								return a.actionButton(gtx, &a.zoomInBtn, "Zoom In")
+							}),
 							layout.Rigid(func(gtx layout.Context) layout.Dimensions { return layout.Spacer{Width: unit.Dp(8)}.Layout(gtx) }),
-							layout.Rigid(material.Button(a.th, &a.actualBtn, "1:1").Layout),
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								return a.actionButton(gtx, &a.actualBtn, "1:1")
+							}),
 							layout.Rigid(func(gtx layout.Context) layout.Dimensions { return layout.Spacer{Width: unit.Dp(8)}.Layout(gtx) }),
-							layout.Rigid(material.Button(a.th, &a.fitBtn, "Fit").Layout),
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								return a.actionButton(gtx, &a.fitBtn, "Fit")
+							}),
 							layout.Rigid(func(gtx layout.Context) layout.Dimensions { return layout.Spacer{Width: unit.Dp(8)}.Layout(gtx) }),
-							layout.Rigid(material.Button(a.th, &a.closeBtn, "Close").Layout),
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								return a.actionButton(gtx, &a.closeBtn, "Close")
+							}),
 						)
 					}),
 					layout.Rigid(func(gtx layout.Context) layout.Dimensions {

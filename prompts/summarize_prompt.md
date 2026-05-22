@@ -13,4 +13,3 @@ Preserve:
 Prefer recent information, but do not erase older facts unless contradicted.
 
 Return only the updated summarization.
-

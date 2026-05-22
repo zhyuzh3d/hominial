@@ -263,7 +263,7 @@ func runOrchestrator(ctx context.Context, path string, cfg Config, messageID str
 	if len(calls) == 0 {
 		return OrchestratorResult{}, nil
 	}
-	db, err := openHistoryDB(path)
+	db, err := openInitializedHistoryDB(path)
 	if err != nil {
 		return OrchestratorResult{}, err
 	}
@@ -806,7 +806,7 @@ func executeSelfieTool(ctx context.Context, db *sql.DB, cfg Config, args map[str
 	}
 	refs := stringSlice(args["reference_paths"])
 	if len(refs) == 0 {
-		refs = defaultSelfieReferences()
+		refs = defaultSelfieReferences(db)
 	}
 	if len(refs) == 0 {
 		return map[string]any{"prompt": prompt, "warning": "no reference image configured"}, nil, nil
@@ -1048,7 +1048,12 @@ func intFromObject(obj map[string]any, key string) (int, bool) {
 	return intFromAny(value, 0), true
 }
 
-func defaultSelfieReferences() []string {
+func defaultSelfieReferences(db *sql.DB) []string {
+	if db != nil {
+		if canon := strings.TrimSpace(loadCompanionProfile(db).CanonImage); canon != "" {
+			return []string{canon}
+		}
+	}
 	candidates := []string{
 		"character.png",
 		"character.jpg",
@@ -1086,7 +1091,7 @@ func executeDueScheduledTools(ctx context.Context, path string, cfg Config, limi
 	if limit <= 0 {
 		limit = 10
 	}
-	db, err := openHistoryDB(path)
+	db, err := openInitializedHistoryDB(path)
 	if err != nil {
 		return nil, err
 	}

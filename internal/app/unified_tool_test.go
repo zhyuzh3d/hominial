@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -308,6 +309,231 @@ func TestTerminologyMigration(t *testing.T) {
 	}
 	if tool != "meditate" {
 		t.Fatalf("expected meditate tool, got %q", tool)
+	}
+}
+
+func TestLegacyLongTermMemoriesMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "chat.db")
+	db, err := openHistoryDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`
+		CREATE TABLE long_term_memories (
+			id TEXT PRIMARY KEY,
+			agent_id TEXT NOT NULL,
+			user_id TEXT,
+			content TEXT NOT NULL,
+			rank INTEGER NOT NULL DEFAULT 1,
+			recall_count INTEGER NOT NULL DEFAULT 0,
+			last_recalled_at TEXT,
+			source TEXT NOT NULL DEFAULT 'manual',
+			metadata_json TEXT NOT NULL DEFAULT '{}',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			deleted_at TEXT
+		)
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO long_term_memories(id, agent_id, content, created_at, updated_at) VALUES('legacy_memory', ?, 'legacy content', ?, ?)`, defaultAgentID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	if err := initHistoryDB(path); err != nil {
+		t.Fatalf("init migrated legacy memory db: %v", err)
+	}
+	db, err = openHistoryDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var modelID int
+	var category, status string
+	if err := db.QueryRow(`SELECT model_id, category, status FROM long_term_memories WHERE id = 'legacy_memory'`).Scan(&modelID, &category, &status); err != nil {
+		t.Fatal(err)
+	}
+	if modelID != 1 || category != "" || status != "active" {
+		t.Fatalf("unexpected migrated memory row: modelID=%d category=%q status=%q", modelID, category, status)
+	}
+	if _, err := executeDueScheduledTools(context.Background(), path, Config{}, 10); err != nil {
+		t.Fatalf("scheduler should work after legacy memory migration: %v", err)
+	}
+}
+
+func TestExecuteDueScheduledToolsInitializesSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "chat.db")
+	messages, err := executeDueScheduledTools(context.Background(), path, Config{}, 10)
+	if err != nil {
+		t.Fatalf("execute due scheduled tools should initialize schema: %v", err)
+	}
+	if len(messages) != 0 {
+		t.Fatalf("expected no due messages from seeded future schedules, got %d", len(messages))
+	}
+	db, err := openHistoryDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM scheduled_tool_calls`).Scan(&count); err != nil {
+		t.Fatalf("scheduled_tool_calls should exist after scheduler scan: %v", err)
+	}
+	if count == 0 {
+		t.Fatal("expected default scheduled tools to be seeded")
+	}
+}
+
+func TestUISettingsPersistAndEnterPromptContext(t *testing.T) {
+	path, cleanup := testDB(t)
+	defer cleanup()
+	settings := UISettings{
+		User: ProfileSettings{
+			FullName:    "张老师",
+			Nickname:    "老师",
+			Description: "共同研发 Elli",
+		},
+		Companion: ProfileSettings{
+			FullName:    "苏澄",
+			Nickname:    "小猫",
+			CanonImage:  "character.png",
+			Story:       "第一位伴人。",
+			Personality: "独立，好奇，共情。",
+			Habits:      "每轮对话后评估预测误差。",
+		},
+		System: Config{BaseURL: "https://example.test/v1", Model: "test-model", APIKey: "local-key"},
+	}
+	if err := saveUISettings(path, settings); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadUISettings(path, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.User.FullName != "张老师" || loaded.Companion.Nickname != "小猫" || loaded.System.Model != "test-model" {
+		t.Fatalf("unexpected loaded settings: %#v", loaded)
+	}
+	ctx, err := loadPromptContext(path, defaultPEConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ctx.CompanionProfile.FullName != "苏澄" {
+		t.Fatalf("expected companion profile in prompt context, got %#v", ctx.CompanionProfile)
+	}
+	envelope, err := buildPrompt(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(envelope.SystemPrompt, "full_name=苏澄") || !strings.Contains(envelope.SystemPrompt, "canon_image=character.png") || !strings.Contains(envelope.SystemPrompt, "user_set_profile") {
+		t.Fatalf("expected saved profiles in system prompt:\n%s", envelope.SystemPrompt)
+	}
+}
+
+func TestRuntimeSettingsSchedulesAndPEConfig(t *testing.T) {
+	path, cleanup := testDB(t)
+	defer cleanup()
+	settings := UISettings{
+		System: Config{BaseURL: "https://example.test/v1", Model: "test-model"},
+		Runtime: RuntimeSettings{
+			ContextMessagesK:      24,
+			MemoryTopN:            7,
+			MemoryRandomM:         2,
+			SummarizeThreshold:    55,
+			DreamTriggerThreshold: 88,
+			DailyMeditateEnabled:  false,
+		},
+	}
+	if err := saveUISettings(path, settings); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadUISettings(path, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := peConfigFromRuntime(loaded.Runtime)
+	if cfg.RecentMessagesK != 24 || cfg.LongMemoryTopN != 7 || cfg.LongMemoryRandomM != 2 || cfg.SummarizeThreshold != 55 {
+		t.Fatalf("unexpected PE config: %#v", cfg)
+	}
+	db, err := openHistoryDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var args, status string
+	if err := db.QueryRow(`SELECT arguments_json FROM scheduled_tool_calls WHERE id = 'default_dream_hourly'`).Scan(&args); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(args, `"threshold":88`) {
+		t.Fatalf("expected dream threshold in schedule args, got %s", args)
+	}
+	if err := db.QueryRow(`SELECT status FROM scheduled_tool_calls WHERE id = 'default_meditate_daily'`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "paused" {
+		t.Fatalf("expected daily meditate paused, got %q", status)
+	}
+}
+
+func TestSettingsMemoryKnowledgeEntriesAndWorkflowLogs(t *testing.T) {
+	path, cleanup := testDB(t)
+	defer cleanup()
+	knowledgeID, err := saveMemoryEntry(path, "knowledge", LongTermMemory{
+		Content:    "Elli 的核心指标是 predictive empathy。",
+		TagsJSON:   `["architecture","knowledge"]`,
+		Rank:       8,
+		Confidence: 92,
+		Status:     "active",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if knowledgeID <= 0 {
+		t.Fatalf("expected knowledge id, got %d", knowledgeID)
+	}
+	if _, err := saveMemoryEntry(path, "knowledge", LongTermMemory{
+		ModelID:    knowledgeID,
+		Content:    "Elli 的核心指标是 control_score。",
+		Category:   "knowledge",
+		TagsJSON:   `["metric"]`,
+		Rank:       9,
+		Confidence: 95,
+		Status:     "active",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	knowledge, err := loadMemoryEntries(path, "knowledge", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(knowledge) != 1 || knowledge[0].ModelID != knowledgeID || !strings.Contains(knowledge[0].Content, "control_score") {
+		t.Fatalf("unexpected knowledge entries: %#v", knowledge)
+	}
+	if err := archiveMemoryEntry(path, knowledgeID); err != nil {
+		t.Fatal(err)
+	}
+	knowledge, err = loadMemoryEntries(path, "knowledge", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(knowledge) != 0 {
+		t.Fatalf("expected archived knowledge hidden, got %#v", knowledge)
+	}
+
+	db, err := openHistoryDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logWorkflowAudit(db, "dream", map[string]any{"operation": "check"}, map[string]any{"needs_consolidation": false}, "complete")
+	logWorkflowAudit(db, "meditate", map[string]any{"operation": "status"}, map[string]any{"status": "ready"}, "complete")
+	db.Close()
+	logs, err := loadWorkflowLogs(path, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 2 || logs[0].Name == "" || !strings.Contains(logs[0].Name+logs[1].Name, "dream.workflow") {
+		t.Fatalf("unexpected workflow logs: %#v", logs)
 	}
 }
 

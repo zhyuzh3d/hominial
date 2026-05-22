@@ -55,6 +55,13 @@
   - `soul_optimize` -> `meditate`
   - `soul_optimize_prompt.md` -> `meditate_prompt.md`
 
+## 版本号维护规则
+
+- 当前桌面运行时版本号由代码中的 `appVersion` 常量维护，并在设置页 `About` 中以 `Hominial.Elli version x.y.z` 展示。
+- 任何会改变用户可见功能、数据结构、运行时工作流或设置页面行为的改动，都应同步判断是否需要递增版本号。
+- 版本号采用语义化版本：修复 UI/文案/小 bug 增加 patch；新增用户可见能力增加 minor；破坏兼容或迁移成本较高的改动增加 major。
+- 修改版本号时应同步检查 `About` 展示文案，确保项目名、版本号与当前功能状态一致。
+
 ## 数据权限术语
 
 - 用户主权层：用户通过 UI 设置或锁定的数据，AI 只能读，不能写，例如 `user_set_profile`。
