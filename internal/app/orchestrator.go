@@ -123,6 +123,18 @@ func modelVisibleFunctionTools() []map[string]any {
 				"y":         map[string]any{"type": "integer"},
 				"width":     map[string]any{"type": "integer", "minimum": 1},
 				"height":    map[string]any{"type": "integer", "minimum": 1},
+				"crop_to_window": map[string]any{
+					"type":        "boolean",
+					"description": "For operation=observe or return_screenshot, crop to a matching app window instead of the default fullscreen screenshot.",
+				},
+				"target_app": map[string]any{
+					"type":        "string",
+					"description": "Application/process name for crop_to_window, e.g. Google Chrome.",
+				},
+				"window_title_contains": map[string]any{
+					"type":        "string",
+					"description": "Case-insensitive window title substring for crop_to_window, e.g. WPS Office for Mac.",
+				},
 				"return_screenshot": map[string]any{
 					"type":        "boolean",
 					"description": "For operation=act, capture and return a screenshot after the action sequence. Defaults to true.",

@@ -22,6 +22,10 @@ type ComputerBackend interface {
 	Execute(ctx context.Context, actions []ComputerAction) error
 }
 
+type ComputerWindowLocator interface {
+	LocateWindow(ctx context.Context, opts ComputerScreenshotOptions) (ComputerWindowInfo, error)
+}
+
 type ComputerScreenInfo struct {
 	Width         int     `json:"width"`
 	Height        int     `json:"height"`
@@ -35,6 +39,19 @@ type ComputerScreenshotOptions struct {
 	Y      int
 	Width  int
 	Height int
+
+	TargetApp           string
+	WindowTitleContains string
+	CropToWindow        bool
+}
+
+type ComputerWindowInfo struct {
+	App    string `json:"app"`
+	Title  string `json:"title"`
+	X      int    `json:"x"`
+	Y      int    `json:"y"`
+	Width  int    `json:"width"`
+	Height int    `json:"height"`
 }
 
 type ComputerAction struct {
@@ -69,7 +86,7 @@ func executeComputerTool(ctx context.Context, db *sql.DB, args map[string]any) (
 
 	switch operation {
 	case "observe", "screenshot":
-		path, info, err := captureComputerScreenshot(ctx, screenshotOptionsFromArgs(args))
+		path, info, window, err := captureComputerScreenshot(ctx, screenshotOptionsFromArgs(args))
 		if err != nil {
 			result := computerFailureResult("observe", err)
 			return result, computerFailureMessage(result), nil
@@ -81,6 +98,9 @@ func executeComputerTool(ctx context.Context, db *sql.DB, args map[string]any) (
 			"screen":          info,
 			"screenshot_path": path,
 			"images":          []string{path},
+		}
+		if window != nil {
+			result["window"] = *window
 		}
 		return result, computerResultMessage(result), nil
 	case "act":
@@ -106,7 +126,7 @@ func executeComputerTool(ctx context.Context, db *sql.DB, args map[string]any) (
 			"executed":  len(actions),
 		}
 		if boolArg(args, "return_screenshot", true) {
-			path, info, err := captureComputerScreenshot(ctx, screenshotOptionsFromArgs(args))
+			path, info, window, err := captureComputerScreenshot(ctx, screenshotOptionsFromArgs(args))
 			if err != nil {
 				result["ok"] = false
 				result["screenshot_error"] = err.Error()
@@ -116,6 +136,9 @@ func executeComputerTool(ctx context.Context, db *sql.DB, args map[string]any) (
 			result["screen"] = info
 			result["screenshot_path"] = path
 			result["images"] = []string{path}
+			if window != nil {
+				result["window"] = *window
+			}
 		}
 		return result, computerResultMessage(result), nil
 	default:
@@ -138,6 +161,10 @@ func computerResultMessage(result map[string]any) *Message {
 	if screen, exists := result["screen"]; exists {
 		raw, _ := json.Marshal(screen)
 		fmt.Fprintf(&b, "- screen: %s\n", string(raw))
+	}
+	if window, exists := result["window"]; exists {
+		raw, _ := json.Marshal(window)
+		fmt.Fprintf(&b, "- window: %s\n", string(raw))
 	}
 	if path, _ := result["screenshot_path"].(string); path != "" {
 		fmt.Fprintf(&b, "- screenshot_path: %s\n", path)
@@ -215,8 +242,14 @@ func computerHelpResult(db *sql.DB) map[string]any {
 		"permission_requirements": computerPermissionDiagnosis(),
 		"operations": []map[string]any{
 			{"operation": "help", "description": "Return this API guide. This is safe and available even when computer use is disabled."},
-			{"operation": "observe", "description": "Capture the desktop screenshot. Use callback sendmsg target=ai to continue reasoning from the screenshot."},
+			{"operation": "observe", "description": "Capture the desktop screenshot. Pass crop_to_window=true with target_app/window_title_contains to crop a specific app window without changing the default fullscreen behavior. Use callback sendmsg target=ai to continue reasoning from the screenshot."},
 			{"operation": "act", "description": "Execute up to 10 primitive mouse/keyboard actions. Set return_screenshot=true to observe the result."},
+		},
+		"observe_fields": []map[string]any{
+			{"field": "crop_to_window", "type": "boolean", "description": "When true, locate a matching application window and capture only that window region. Defaults to false."},
+			{"field": "target_app", "type": "string", "description": "Application/process name to match, e.g. Google Chrome or Chrome."},
+			{"field": "window_title_contains", "type": "string", "description": "Case-insensitive substring of the window title, e.g. WPS Office for Mac."},
+			{"field": "x/y/width/height", "type": "integer", "description": "Optional manual screenshot region. Existing fullscreen observe remains unchanged when omitted."},
 		},
 		"actions": []map[string]any{
 			{"type": "move", "fields": "x, y", "description": "Move mouse pointer to screenshot pixel coordinates."},
@@ -235,6 +268,13 @@ func computerHelpResult(db *sql.DB) map[string]any {
 			"observe_then_continue": map[string]any{
 				"operation": "observe",
 				"callback":  map[string]any{"tool": "sendmsg", "args": map[string]any{"target": "ai", "kind": "tool_result"}},
+			},
+			"observe_window_then_continue": map[string]any{
+				"operation":             "observe",
+				"crop_to_window":        true,
+				"target_app":            "Google Chrome",
+				"window_title_contains": "WPS Office for Mac",
+				"callback":              map[string]any{"tool": "sendmsg", "args": map[string]any{"target": "ai", "kind": "tool_result"}},
 			},
 			"act_then_continue": map[string]any{
 				"operation":         "act",
@@ -263,35 +303,55 @@ func computerUseEnabled(db *sql.DB) bool {
 	return normalizeRuntimeSettings(settings).ComputerUseEnabled
 }
 
-func captureComputerScreenshot(ctx context.Context, opts ComputerScreenshotOptions) (string, ComputerScreenInfo, error) {
+func captureComputerScreenshot(ctx context.Context, opts ComputerScreenshotOptions) (string, ComputerScreenInfo, *ComputerWindowInfo, error) {
+	var window *ComputerWindowInfo
+	if opts.CropToWindow {
+		locator, ok := currentComputerBackend.(ComputerWindowLocator)
+		if !ok {
+			return "", ComputerScreenInfo{}, nil, errors.New("computer backend does not support window lookup")
+		}
+		located, err := locator.LocateWindow(ctx, opts)
+		if err != nil {
+			return "", ComputerScreenInfo{}, nil, err
+		}
+		window = &located
+		opts.X = located.X
+		opts.Y = located.Y
+		opts.Width = located.Width
+		opts.Height = located.Height
+	}
+
 	img, info, err := currentComputerBackend.Screenshot(ctx, opts)
 	if err != nil {
-		return "", ComputerScreenInfo{}, err
+		return "", ComputerScreenInfo{}, nil, err
 	}
 	if img == nil {
-		return "", ComputerScreenInfo{}, errors.New("computer backend returned nil screenshot")
+		return "", ComputerScreenInfo{}, nil, errors.New("computer backend returned nil screenshot")
 	}
 	outPath, err := appOutputPath("screenshots", "screen_"+time.Now().Format("20060102_150405_000000000")+".png")
 	if err != nil {
-		return "", ComputerScreenInfo{}, err
+		return "", ComputerScreenInfo{}, nil, err
 	}
 	f, err := os.Create(outPath)
 	if err != nil {
-		return "", ComputerScreenInfo{}, err
+		return "", ComputerScreenInfo{}, nil, err
 	}
 	defer f.Close()
 	if err := png.Encode(f, img); err != nil {
-		return "", ComputerScreenInfo{}, err
+		return "", ComputerScreenInfo{}, nil, err
 	}
-	return outPath, info, nil
+	return outPath, info, window, nil
 }
 
 func screenshotOptionsFromArgs(args map[string]any) ComputerScreenshotOptions {
 	return ComputerScreenshotOptions{
-		X:      intFromAny(args["x"], 0),
-		Y:      intFromAny(args["y"], 0),
-		Width:  intFromAny(args["width"], 0),
-		Height: intFromAny(args["height"], 0),
+		X:                   intFromAny(args["x"], 0),
+		Y:                   intFromAny(args["y"], 0),
+		Width:               intFromAny(args["width"], 0),
+		Height:              intFromAny(args["height"], 0),
+		TargetApp:           strings.TrimSpace(stringArg(args, "target_app")),
+		WindowTitleContains: strings.TrimSpace(stringArg(args, "window_title_contains")),
+		CropToWindow:        boolArg(args, "crop_to_window", false),
 	}
 }
 

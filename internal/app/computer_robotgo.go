@@ -2,12 +2,15 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"image"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -66,6 +69,51 @@ func (robotGoComputerBackend) Screenshot(ctx context.Context, opts ComputerScree
 	return img, info, nil
 }
 
+func (robotGoComputerBackend) LocateWindow(ctx context.Context, opts ComputerScreenshotOptions) (ComputerWindowInfo, error) {
+	if runtime.GOOS != "darwin" {
+		return ComputerWindowInfo{}, errors.New("window lookup is currently implemented only on macOS")
+	}
+	targetApp := strings.TrimSpace(opts.TargetApp)
+	titleContains := strings.TrimSpace(opts.WindowTitleContains)
+	if targetApp == "" && titleContains == "" {
+		return ComputerWindowInfo{}, errors.New("target_app or window_title_contains is required for crop_to_window")
+	}
+
+	script := `
+set windowLines to ""
+tell application "System Events"
+	repeat with p in application processes
+		set appName to name of p as text
+		try
+			repeat with w in windows of p
+				set winTitle to name of w as text
+				set winPos to position of w
+				set winSize to size of w
+				set windowLines to windowLines & appName & tab & winTitle & tab & (item 1 of winPos as integer) & tab & (item 2 of winPos as integer) & tab & (item 1 of winSize as integer) & tab & (item 2 of winSize as integer) & linefeed
+			end repeat
+		end try
+	end repeat
+end tell
+return windowLines
+`
+	out, err := exec.CommandContext(ctx, "osascript", "-e", script).Output()
+	if err != nil {
+		return ComputerWindowInfo{}, fmt.Errorf("window lookup failed: %w", err)
+	}
+	windows := parseMacWindowRows(string(out))
+	for _, window := range windows {
+		if !windowMatches(window, targetApp, titleContains) {
+			continue
+		}
+		info, err := robotGoComputerBackend{}.ScreenInfo()
+		if err != nil {
+			return ComputerWindowInfo{}, err
+		}
+		return scaleAndClampWindow(window, info), nil
+	}
+	return ComputerWindowInfo{}, fmt.Errorf("window not found for app=%q title_contains=%q", targetApp, titleContains)
+}
+
 func (robotGoComputerBackend) Execute(ctx context.Context, actions []ComputerAction) error {
 	for _, action := range actions {
 		if err := ctx.Err(); err != nil {
@@ -114,6 +162,82 @@ func (robotGoComputerBackend) Execute(ctx context.Context, actions []ComputerAct
 		}
 	}
 	return nil
+}
+
+func parseMacWindowRows(raw string) []ComputerWindowInfo {
+	var windows []ComputerWindowInfo
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, "\t")
+		if len(parts) < 6 {
+			continue
+		}
+		x, xErr := strconv.Atoi(strings.TrimSpace(parts[2]))
+		y, yErr := strconv.Atoi(strings.TrimSpace(parts[3]))
+		w, wErr := strconv.Atoi(strings.TrimSpace(parts[4]))
+		h, hErr := strconv.Atoi(strings.TrimSpace(parts[5]))
+		if xErr != nil || yErr != nil || wErr != nil || hErr != nil || w <= 0 || h <= 0 {
+			continue
+		}
+		windows = append(windows, ComputerWindowInfo{
+			App:    strings.TrimSpace(parts[0]),
+			Title:  strings.TrimSpace(parts[1]),
+			X:      x,
+			Y:      y,
+			Width:  w,
+			Height: h,
+		})
+	}
+	return windows
+}
+
+func windowMatches(window ComputerWindowInfo, targetApp, titleContains string) bool {
+	if targetApp != "" {
+		app := strings.ToLower(window.App)
+		target := strings.ToLower(targetApp)
+		if app != target && !strings.Contains(app, target) && !strings.Contains(target, app) {
+			return false
+		}
+	}
+	if titleContains != "" && !strings.Contains(strings.ToLower(window.Title), strings.ToLower(titleContains)) {
+		return false
+	}
+	return true
+}
+
+func scaleAndClampWindow(window ComputerWindowInfo, info ComputerScreenInfo) ComputerWindowInfo {
+	scale := info.Scale
+	if scale <= 0 {
+		scale = 1
+	}
+	window.X = int(math.Round(float64(window.X) * scale))
+	window.Y = int(math.Round(float64(window.Y) * scale))
+	window.Width = int(math.Round(float64(window.Width) * scale))
+	window.Height = int(math.Round(float64(window.Height) * scale))
+	if window.X < 0 {
+		window.Width += window.X
+		window.X = 0
+	}
+	if window.Y < 0 {
+		window.Height += window.Y
+		window.Y = 0
+	}
+	if info.Width > 0 && window.X+window.Width > info.Width {
+		window.Width = info.Width - window.X
+	}
+	if info.Height > 0 && window.Y+window.Height > info.Height {
+		window.Height = info.Height - window.Y
+	}
+	if window.Width < 1 {
+		window.Width = 1
+	}
+	if window.Height < 1 {
+		window.Height = 1
+	}
+	return window
 }
 
 func keyTapArgs(modifiers []string) []interface{} {

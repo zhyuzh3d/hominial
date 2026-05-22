@@ -213,6 +213,28 @@ func TestComputerToolHelpPermissionsAndContinuationImage(t *testing.T) {
 		t.Fatalf("expected input_image part, got %#v", input)
 	}
 
+	currentComputerBackend = fakeWindowComputerBackend{}
+	windowed, msg, err := executeComputerTool(context.Background(), db, map[string]any{
+		"operation":             "observe",
+		"crop_to_window":        true,
+		"target_app":            "Google Chrome",
+		"window_title_contains": "WPS Office for Mac",
+	})
+	if err != nil {
+		t.Fatalf("computer window observe: %v", err)
+	}
+	windowPath, _ := windowed["screenshot_path"].(string)
+	if windowPath == "" {
+		t.Fatalf("missing window screenshot path: %#v", windowed)
+	}
+	defer os.Remove(windowPath)
+	if windowed["window"] == nil {
+		t.Fatalf("expected window metadata, got %#v", windowed)
+	}
+	if msg == nil || !strings.Contains(msg.Text, "window") {
+		t.Fatalf("expected user-visible window result message, got %#v", msg)
+	}
+
 	currentComputerBackend = failingComputerBackend{}
 	failed, _, err := executeComputerTool(context.Background(), db, map[string]any{"operation": "observe"})
 	if err != nil {
@@ -236,6 +258,31 @@ func (fakeComputerBackend) Screenshot(context.Context, ComputerScreenshotOptions
 }
 
 func (fakeComputerBackend) Execute(context.Context, []ComputerAction) error { return nil }
+
+type fakeWindowComputerBackend struct{}
+
+func (fakeWindowComputerBackend) Name() string { return "fake-window" }
+
+func (fakeWindowComputerBackend) ScreenInfo() (ComputerScreenInfo, error) {
+	return ComputerScreenInfo{Width: 100, Height: 80, Scale: 1}, nil
+}
+
+func (fakeWindowComputerBackend) Screenshot(_ context.Context, opts ComputerScreenshotOptions) (image.Image, ComputerScreenInfo, error) {
+	w, h := opts.Width, opts.Height
+	if w <= 0 {
+		w = 100
+	}
+	if h <= 0 {
+		h = 80
+	}
+	return image.NewRGBA(image.Rect(0, 0, w, h)), ComputerScreenInfo{Width: 100, Height: 80, Scale: 1}, nil
+}
+
+func (fakeWindowComputerBackend) LocateWindow(context.Context, ComputerScreenshotOptions) (ComputerWindowInfo, error) {
+	return ComputerWindowInfo{App: "Google Chrome", Title: "WPS Office for Mac", X: 10, Y: 20, Width: 30, Height: 40}, nil
+}
+
+func (fakeWindowComputerBackend) Execute(context.Context, []ComputerAction) error { return nil }
 
 type failingComputerBackend struct{}
 

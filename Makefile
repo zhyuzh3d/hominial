@@ -42,8 +42,13 @@ build:
 	@if command -v xattr >/dev/null 2>&1; then xattr -d com.apple.FinderInfo $(APP_BUNDLE) 2>/dev/null || true; fi
 	@if command -v xattr >/dev/null 2>&1; then xattr -d 'com.apple.fileprovider.fpfs#P' $(APP_BUNDLE) 2>/dev/null || true; fi
 	@if command -v codesign >/dev/null 2>&1; then \
-		if [ -n "$(CODESIGN_IDENTITY)" ]; then codesign --force --deep --sign "$(CODESIGN_IDENTITY)" $(APP_BUNDLE); else false; fi || \
-		codesign --force --deep --sign - $(APP_BUNDLE) || true; \
+		signed=0; \
+		if command -v xattr >/dev/null 2>&1; then xattr -d com.apple.FinderInfo $(APP_BUNDLE) 2>/dev/null || true; xattr -d 'com.apple.fileprovider.fpfs#P' $(APP_BUNDLE) 2>/dev/null || true; fi; \
+		if [ -n "$(CODESIGN_IDENTITY)" ] && codesign --force --deep --sign "$(CODESIGN_IDENTITY)" $(APP_BUNDLE); then signed=1; fi; \
+		if [ "$$signed" -eq 0 ]; then \
+			if command -v xattr >/dev/null 2>&1; then xattr -d com.apple.FinderInfo $(APP_BUNDLE) 2>/dev/null || true; xattr -d 'com.apple.fileprovider.fpfs#P' $(APP_BUNDLE) 2>/dev/null || true; fi; \
+			codesign --force --deep --sign - $(APP_BUNDLE) || true; \
+		fi; \
 	fi
 
 run:
