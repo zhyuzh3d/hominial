@@ -170,6 +170,74 @@ func callReferenceImage(ctx context.Context, cfg Config, prompt string, refs []s
 	return Message{Role: "assistant", Text: strings.TrimSpace(text), Images: images, CreatedAt: time.Now()}, nil
 }
 
+func callCheckNextAI(ctx context.Context, cfg Config, goal, lastAction, successCriteria, blockedCriteria, screenshotPath string) (CheckNextAIResult, string, error) {
+	if cfg.APIKey == "" {
+		return CheckNextAIResult{}, "", errors.New("missing OPENAI_API_KEY in ~/.codex/auth.json or environment")
+	}
+	if cfg.BaseURL == "" || cfg.Model == "" {
+		return CheckNextAIResult{}, "", errors.New("base URL and model are required")
+	}
+	dataURL, err := fileDataURL(screenshotPath)
+	if err != nil {
+		return CheckNextAIResult{}, "", err
+	}
+	prompt := fmt.Sprintf(`You are checkNext_ai, a narrow visual gate for a desktop automation step.
+Do not plan mouse or keyboard actions. Do not chat. Decide whether the main AI should continue, keep waiting, or stop.
+
+Task goal: %s
+Last action: %s
+Success criteria: %s
+Blocked criteria: %s
+
+Return strict JSON only:
+{"state":"waiting|ready_for_next|done|blocked|uncertain","reason":"short reason","confidence":0.0,"suggested_wait_ms":10000}
+`, emptyDefault(goal, "unknown"), emptyDefault(lastAction, "unknown"), emptyDefault(successCriteria, "visible evidence that the previous action has progressed or completed"), emptyDefault(blockedCriteria, "permission dialogs, browser blocks, errors, or user confirmation prompts"))
+	body := map[string]any{
+		"model":  cfg.Model,
+		"stream": true,
+		"input": []map[string]any{{
+			"role": "user",
+			"content": []map[string]any{
+				{"type": "input_text", "text": prompt},
+				{"type": "input_image", "image_url": dataURL},
+			},
+		}},
+		"text": map[string]any{"format": map[string]any{"type": "json_object"}},
+	}
+	data, _ := json.Marshal(body)
+	url := strings.TrimRight(cfg.BaseURL, "/")
+	if !strings.HasSuffix(url, "/v1") {
+		url += "/v1"
+	}
+	url += "/responses"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
+	if err != nil {
+		return CheckNextAIResult{}, "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 2 * time.Minute}).Do(req)
+	if err != nil {
+		return CheckNextAIResult{}, "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		raw, _ := io.ReadAll(resp.Body)
+		return CheckNextAIResult{}, "", fmt.Errorf("api %s: %s", resp.Status, trimForStatus(raw))
+	}
+	text, _, _, err := parseResponseStream(resp.Body)
+	if err != nil {
+		return CheckNextAIResult{}, "", err
+	}
+	var result CheckNextAIResult
+	if err := json.Unmarshal([]byte(strings.TrimSpace(text)), &result); err != nil {
+		return CheckNextAIResult{}, text, err
+	}
+	result.State = strings.TrimSpace(result.State)
+	result.Reason = strings.TrimSpace(result.Reason)
+	return result, text, nil
+}
+
 func parseResponse(raw []byte) (string, []string, []ToolCall, error) {
 	var root any
 	if err := json.Unmarshal(raw, &root); err != nil {

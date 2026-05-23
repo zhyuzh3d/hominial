@@ -4,7 +4,7 @@ APP_CONTENTS := $(APP_BUNDLE)/Contents
 APP_MACOS := $(APP_CONTENTS)/MacOS
 APP_RESOURCES := $(APP_CONTENTS)/Resources
 APP_CMD := ./cmd/eibanban
-APP_VERSION := 0.3.3
+APP_VERSION := 0.4.0
 CODESIGN_IDENTITY ?= $(shell security find-identity -v -p codesigning 2>/dev/null | awk '/Codexide Local Code Signing/ { print $$2; exit }')
 
 .PHONY: build run test clean

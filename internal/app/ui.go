@@ -71,6 +71,7 @@ func (a *ChatApp) layout(gtx layout.Context) layout.Dimensions {
 		}),
 	)
 	a.previewOverlay(gtx)
+	a.checkNextOverlay(gtx)
 	a.settingsOverlay(gtx)
 	return dims
 }
@@ -276,7 +277,17 @@ func (a *ChatApp) bubbleContent(gtx layout.Context, msg Message, isUser bool) la
 						body = a.uiText("empty_tool_message")
 					}
 				}
-				return a.selectableTextStyled(gtx, "message:"+msg.ID, compactParagraphSpacing(body), uiSp(uiTextBody), rgb(21, 28, 43), false, font.SemiBold, 1.55)
+				content := func(gtx layout.Context) layout.Dimensions {
+					return a.selectableTextStyled(gtx, "message:"+msg.ID, compactParagraphSpacing(body), uiSp(uiTextBody), rgb(21, 28, 43), false, font.SemiBold, 1.55)
+				}
+				if hasComputerToolCall(msg.ToolCalls) {
+					btn := a.checkNextButtonFor(msg.ID)
+					for btn.Clicked(gtx) {
+						a.openCheckNextForMessage(msg)
+					}
+					return handClickable(gtx, btn, content)
+				}
+				return content(gtx)
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				paths := append([]string{}, msg.Attachments...)
@@ -370,6 +381,77 @@ func toolCallNames(calls []ToolCall) string {
 		names = append(names, call.Name)
 	}
 	return strings.Join(names, ", ")
+}
+
+func hasComputerToolCall(calls []ToolCall) bool {
+	for _, call := range calls {
+		if call.Name == "computer" {
+			return true
+		}
+	}
+	return false
+}
+
+func firstComputerToolCallID(calls []ToolCall) string {
+	for _, call := range calls {
+		if call.Name == "computer" {
+			return call.ID
+		}
+	}
+	return ""
+}
+
+func (a *ChatApp) checkNextButtonFor(messageID string) *widget.Clickable {
+	if a.checkNext.OpenBtns == nil {
+		a.checkNext.OpenBtns = make(map[string]*widget.Clickable)
+	}
+	btn := a.checkNext.OpenBtns[messageID]
+	if btn == nil {
+		btn = new(widget.Clickable)
+		a.checkNext.OpenBtns[messageID] = btn
+	}
+	return btn
+}
+
+func (a *ChatApp) openCheckNextForMessage(msg Message) {
+	toolCallID := firstComputerToolCallID(msg.ToolCalls)
+	if toolCallID == "" {
+		return
+	}
+	db, err := openInitializedHistoryDB(a.historyPath)
+	if err != nil {
+		a.setStatus("CheckNext error: " + err.Error())
+		return
+	}
+	stepID, err := latestComputerStepForToolCall(db, toolCallID)
+	db.Close()
+	if err != nil || stepID == "" {
+		a.mu.Lock()
+		a.checkNext.Open = true
+		a.checkNext.Title = "CheckNext"
+		a.checkNext.StepID = ""
+		a.checkNext.Checks = nil
+		a.checkNext.StatusText = a.uiText("checknext_no_records")
+		a.mu.Unlock()
+		a.win.Invalidate()
+		return
+	}
+	checks, err := loadComputerStepChecks(a.historyPath, stepID, 120)
+	a.mu.Lock()
+	a.checkNext.Open = true
+	a.checkNext.Title = "CheckNext"
+	a.checkNext.StepID = stepID
+	a.checkNext.Checks = checks
+	a.checkNext.LoadedAt = time.Now()
+	if err != nil {
+		a.checkNext.StatusText = err.Error()
+	} else if len(checks) == 0 {
+		a.checkNext.StatusText = a.uiText("checknext_no_records")
+	} else {
+		a.checkNext.StatusText = ""
+	}
+	a.mu.Unlock()
+	a.win.Invalidate()
 }
 
 func (a *ChatApp) cachedImageOp(path string) (image.Image, paint.ImageOp, error) {
@@ -1612,6 +1694,9 @@ var enUIStrings = map[string]string{
 	"clear":                   "Clear",
 	"send":                    "Send",
 	"sending":                 "Sending",
+	"close":                   "Close",
+	"checknext_title":         "CheckNext Checks",
+	"checknext_no_records":    "No checkNext records for this computer act yet.",
 	"save":                    "Save",
 	"done":                    "Done",
 	"tab_user_profile":        "User Profile",
@@ -1698,6 +1783,9 @@ var zhUIStrings = map[string]string{
 	"clear":                   "清空",
 	"send":                    "发送",
 	"sending":                 "发送中",
+	"close":                   "关闭",
+	"checknext_title":         "CheckNext 检查记录",
+	"checknext_no_records":    "这个 computer act 暂无 checkNext 检查记录。",
 	"save":                    "保存",
 	"done":                    "完成",
 	"tab_user_profile":        "用户画像",

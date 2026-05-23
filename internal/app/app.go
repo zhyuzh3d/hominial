@@ -24,7 +24,7 @@ import (
 	"gioui.org/widget/material"
 )
 
-const appVersion = "0.3.3"
+const appVersion = "0.4.0"
 
 type ChatApp struct {
 	win *gioapp.Window
@@ -84,6 +84,7 @@ type ChatApp struct {
 	peConfig       PEConfig
 	hasOlder       bool
 	preview        previewState
+	checkNext      checkNextOverlayState
 	imgCache       map[string]image.Image
 	imgOps         map[string]paint.ImageOp
 	imageButtons   map[string]*widget.Clickable
@@ -154,6 +155,7 @@ func NewChatApp(w *gioapp.Window) *ChatApp {
 		removeButtons:  make(map[string]*widget.Clickable),
 		memoryButtons:  make(map[int]*widget.Clickable),
 		textEditors:    make(map[string]*widget.Editor),
+		checkNext:      checkNextOverlayState{OpenBtns: make(map[string]*widget.Clickable)},
 		status:         "Ready",
 		scrollToEnd:    true,
 		memoryMode:     "memory",

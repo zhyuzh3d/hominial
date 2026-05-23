@@ -21,9 +21,9 @@ func testDB(t *testing.T) (string, func()) {
 }
 
 func TestUnifiedMemoryToolAndQuery(t *testing.T) {
-	path, cleanup := testDB(t)
+	dbPath, cleanup := testDB(t)
 	defer cleanup()
-	db, err := openHistoryDB(path)
+	db, err := openHistoryDB(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,9 +61,9 @@ func TestUnifiedMemoryToolAndQuery(t *testing.T) {
 }
 
 func TestDBToolPermissionsAndSendMsg(t *testing.T) {
-	path, cleanup := testDB(t)
+	dbPath, cleanup := testDB(t)
 	defer cleanup()
-	db, err := openHistoryDB(path)
+	db, err := openHistoryDB(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,9 +156,9 @@ func TestContinuationFromSendMsgResult(t *testing.T) {
 }
 
 func TestComputerToolHelpPermissionsAndContinuationImage(t *testing.T) {
-	path, cleanup := testDB(t)
+	dbPath, cleanup := testDB(t)
 	defer cleanup()
-	db, err := openHistoryDB(path)
+	db, err := openHistoryDB(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +168,7 @@ func TestComputerToolHelpPermissionsAndContinuationImage(t *testing.T) {
 	currentComputerBackend = fakeComputerBackend{}
 	defer func() { currentComputerBackend = oldBackend }()
 
-	help, _, err := executeComputerTool(context.Background(), db, map[string]any{"operation": "help"})
+	help, _, err := executeComputerTool(context.Background(), db, Config{}, map[string]any{"operation": "help"}, "", "")
 	if err != nil {
 		t.Fatalf("computer help: %v", err)
 	}
@@ -194,25 +194,25 @@ func TestComputerToolHelpPermissionsAndContinuationImage(t *testing.T) {
 	if len(withReminder) != 1 || !strings.Contains(withReminder[0].Text, "Computer API guide has already been fetched") {
 		t.Fatalf("expected computer help reminder, got %#v", withReminder)
 	}
-	if _, _, err := executeComputerTool(context.Background(), db, map[string]any{"operation": "observe"}); err == nil {
+	if _, _, err := executeComputerTool(context.Background(), db, Config{}, map[string]any{"operation": "observe"}, "", ""); err == nil {
 		t.Fatal("expected observe to be denied while disabled")
 	}
 	if err := saveAppSetting(db, "runtime_settings", RuntimeSettings{ComputerUseEnabled: true}); err != nil {
 		t.Fatalf("save runtime settings: %v", err)
 	}
-	observed, _, err := executeComputerTool(context.Background(), db, map[string]any{"operation": "observe"})
+	observed, _, err := executeComputerTool(context.Background(), db, Config{}, map[string]any{"operation": "observe"}, "", "")
 	if err != nil {
 		t.Fatalf("computer observe: %v", err)
 	}
-	path, _ = observed["screenshot_path"].(string)
-	if path == "" {
+	screenshotPath, _ := observed["screenshot_path"].(string)
+	if screenshotPath == "" {
 		t.Fatalf("missing screenshot path: %#v", observed)
 	}
-	defer os.Remove(path)
+	defer os.Remove(screenshotPath)
 	result, _, err := executeSendMsgTool(map[string]any{
 		"target": "ai",
 		"kind":   "tool_result",
-		"images": []any{path},
+		"images": []any{screenshotPath},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -235,12 +235,12 @@ func TestComputerToolHelpPermissionsAndContinuationImage(t *testing.T) {
 
 	windowBackend := &fakeWindowComputerBackend{}
 	currentComputerBackend = windowBackend
-	windowed, msg, err := executeComputerTool(context.Background(), db, map[string]any{
+	windowed, msg, err := executeComputerTool(context.Background(), db, Config{}, map[string]any{
 		"operation":             "observe",
 		"crop_to_window":        true,
 		"target_app":            "Google Chrome",
 		"window_title_contains": "WPS Office for Mac",
-	})
+	}, "", "")
 	if err != nil {
 		t.Fatalf("computer window observe: %v", err)
 	}
@@ -264,7 +264,7 @@ func TestComputerToolHelpPermissionsAndContinuationImage(t *testing.T) {
 
 	changingBackend := &fakeChangingComputerBackend{}
 	currentComputerBackend = changingBackend
-	acted, _, err := executeComputerTool(context.Background(), db, map[string]any{
+	acted, _, err := executeComputerTool(context.Background(), db, Config{}, map[string]any{
 		"operation":           "act",
 		"actions":             []any{map[string]any{"type": "move", "x": float64(1), "y": float64(1)}},
 		"return_screenshot":   true,
@@ -272,7 +272,7 @@ func TestComputerToolHelpPermissionsAndContinuationImage(t *testing.T) {
 		"observe_retries":     float64(2),
 		"observe_interval_ms": float64(0),
 		"wait_until_changed":  true,
-	})
+	}, "call_computer_act", "msg_test")
 	if err != nil {
 		t.Fatalf("computer act wait loop: %v", err)
 	}
@@ -288,9 +288,20 @@ func TestComputerToolHelpPermissionsAndContinuationImage(t *testing.T) {
 	if changingBackend.screenshotCount != 2 || changingBackend.executed != 1 {
 		t.Fatalf("expected baseline plus post-action screenshot, got screenshots=%d executed=%d", changingBackend.screenshotCount, changingBackend.executed)
 	}
+	stepID, _ := acted["computer_step_id"].(string)
+	if stepID == "" {
+		t.Fatalf("expected computer step id, got %#v", acted)
+	}
+	checks, err := loadComputerStepChecks(dbPath, stepID, 20)
+	if err != nil {
+		t.Fatalf("load computer step checks: %v", err)
+	}
+	if len(checks) < 2 || checks[0].Kind != "checkNext_local" || checks[0].CreatedAt.IsZero() {
+		t.Fatalf("expected timestamped local checks, got %#v", checks)
+	}
 
 	currentComputerBackend = failingComputerBackend{}
-	failed, _, err := executeComputerTool(context.Background(), db, map[string]any{"operation": "observe"})
+	failed, _, err := executeComputerTool(context.Background(), db, Config{}, map[string]any{"operation": "observe"}, "", "")
 	if err != nil {
 		t.Fatalf("computer observe failures should be model-visible results, got error: %v", err)
 	}

@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"gioui.org/f32"
+	"gioui.org/widget"
 )
 
 type Config struct {
@@ -60,6 +61,18 @@ type Message struct {
 	ToolCalls   []ToolCall
 }
 
+type checkNextOverlayState struct {
+	Open       bool
+	Title      string
+	StepID     string
+	Checks     []ComputerStepCheck
+	CloseBtn   widget.Clickable
+	List       widget.List
+	OpenBtns   map[string]*widget.Clickable
+	LoadedAt   time.Time
+	StatusText string
+}
+
 type ToolCall struct {
 	ID        string
 	Name      string
@@ -79,6 +92,30 @@ type ToolContinuation struct {
 	Images        []string
 	Payload       map[string]any
 	Informational bool
+}
+
+type ComputerStepCheck struct {
+	ID             string
+	StepID         string
+	Kind           string
+	Attempt        int
+	ElapsedMS      int
+	ScreenshotPath string
+	DiffScore      float64
+	Changed        bool
+	Stable         bool
+	State          string
+	Reason         string
+	Confidence     float64
+	ResultJSON     string
+	CreatedAt      time.Time
+}
+
+type CheckNextAIResult struct {
+	State           string  `json:"state"`
+	Reason          string  `json:"reason"`
+	Confidence      float64 `json:"confidence"`
+	SuggestedWaitMS int     `json:"suggested_wait_ms,omitempty"`
 }
 
 type OrchestratorResult struct {

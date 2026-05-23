@@ -59,6 +59,13 @@ type ComputerObservationOptions struct {
 	ObserveIntervalMS int
 	WaitUntilChanged  bool
 	ChangeThreshold   float64
+	CheckNextAI       bool
+	AIIntervalMS      int
+	MaxAIChecks       int
+	WaitGoal          string
+	SuccessCriteria   string
+	BlockedCriteria   string
+	LastAction        string
 }
 
 type ComputerScreenshotResult struct {
@@ -95,7 +102,7 @@ type ComputerAction struct {
 
 var currentComputerBackend ComputerBackend = newRobotGoComputerBackend()
 
-func executeComputerTool(ctx context.Context, db *sql.DB, args map[string]any) (map[string]any, *Message, error) {
+func executeComputerTool(ctx context.Context, db *sql.DB, cfg Config, args map[string]any, toolCallID, messageID string) (map[string]any, *Message, error) {
 	operation := emptyDefault(stringArg(args, "operation"), "help")
 	if operation == "help" || operation == "apis" || operation == "get_apis" {
 		return computerHelpResult(db), nil, nil
@@ -109,7 +116,7 @@ func executeComputerTool(ctx context.Context, db *sql.DB, args map[string]any) (
 
 	switch operation {
 	case "observe", "screenshot":
-		result, observation, err := observeComputer(ctx, screenshotOptionsFromArgs(args), observationOptionsFromArgs(args, false), nil)
+		result, observation, err := observeComputer(ctx, cfg, screenshotOptionsFromArgs(args), observationOptionsFromArgs(args, false), nil, nil)
 		if err != nil {
 			result := computerFailureResult("observe", err)
 			return result, computerFailureMessage(result), nil
@@ -128,14 +135,18 @@ func executeComputerTool(ctx context.Context, db *sql.DB, args map[string]any) (
 		}
 		return payload, computerResultMessage(payload), nil
 	case "act":
+		stepLogger := startComputerStep(db, toolCallID, messageID, args)
 		actions, err := computerActionsFromAny(args["actions"])
 		if err != nil {
+			stepLogger.Complete("failed", map[string]any{"error": err.Error()})
 			return nil, nil, err
 		}
 		if len(actions) == 0 {
+			stepLogger.Complete("failed", map[string]any{"error": "actions are required"})
 			return nil, nil, errors.New("actions are required")
 		}
 		if len(actions) > maxComputerActions {
+			stepLogger.Complete("failed", map[string]any{"error": fmt.Sprintf("too many computer actions: max %d", maxComputerActions)})
 			return nil, nil, fmt.Errorf("too many computer actions: max %d", maxComputerActions)
 		}
 		returnScreenshot := boolArg(args, "return_screenshot", true)
@@ -148,6 +159,10 @@ func executeComputerTool(ctx context.Context, db *sql.DB, args map[string]any) (
 				result := computerFailureResult("act", err)
 				result["executed"] = 0
 				result["stage"] = "pre_action_observe"
+				if stepID := stepLogger.StepID(); stepID != "" {
+					result["computer_step_id"] = stepID
+				}
+				stepLogger.Complete("failed", result)
 				return result, computerFailureMessage(result), nil
 			}
 			baseline = computerImageSignature(before)
@@ -155,6 +170,10 @@ func executeComputerTool(ctx context.Context, db *sql.DB, args map[string]any) (
 		if err := currentComputerBackend.Execute(ctx, actions); err != nil {
 			result := computerFailureResult("act", err)
 			result["executed"] = 0
+			if stepID := stepLogger.StepID(); stepID != "" {
+				result["computer_step_id"] = stepID
+			}
+			stepLogger.Complete("failed", result)
 			return result, computerFailureMessage(result), nil
 		}
 		result := map[string]any{
@@ -163,12 +182,16 @@ func executeComputerTool(ctx context.Context, db *sql.DB, args map[string]any) (
 			"backend":   currentComputerBackend.Name(),
 			"executed":  len(actions),
 		}
+		if stepID := stepLogger.StepID(); stepID != "" {
+			result["computer_step_id"] = stepID
+		}
 		if returnScreenshot {
-			screenshot, observation, err := observeComputer(ctx, screenshotOpts, observationOpts, baseline)
+			screenshot, observation, err := observeComputer(ctx, cfg, screenshotOpts, observationOpts, baseline, stepLogger)
 			if err != nil {
 				result["ok"] = false
 				result["screenshot_error"] = err.Error()
 				result["diagnosis"] = computerPermissionDiagnosis()
+				stepLogger.Complete("failed", result)
 				return result, computerFailureMessage(result), nil
 			}
 			result["screen"] = screenshot.Info
@@ -179,6 +202,7 @@ func executeComputerTool(ctx context.Context, db *sql.DB, args map[string]any) (
 				result["window"] = *screenshot.Window
 			}
 		}
+		stepLogger.Complete("complete", result)
 		return result, computerResultMessage(result), nil
 	default:
 		return nil, nil, fmt.Errorf("unsupported computer operation %q", operation)
@@ -301,6 +325,10 @@ func computerHelpResult(db *sql.DB) map[string]any {
 			{"field": "observe_interval_ms", "type": "integer", "description": "Milliseconds between screenshot attempts while waiting for change. Defaults to 1000. Max 10000."},
 			{"field": "wait_until_changed", "type": "boolean", "description": "When true, compare screenshots and keep waiting until the image changes enough or retries are exhausted. For act, the baseline is captured before actions run."},
 			{"field": "change_threshold", "type": "number", "description": "Normalized visual difference needed for wait_until_changed. Defaults to 0.02."},
+			{"field": "check_next_ai", "type": "boolean", "description": "When true, periodically call a narrow visual judge outside the main chat context to decide waiting/done/blocked/ready_for_next."},
+			{"field": "ai_check_interval_ms", "type": "integer", "description": "Minimum time between checkNext_ai calls. Defaults to 10000 ms."},
+			{"field": "max_ai_checks", "type": "integer", "description": "Maximum checkNext_ai calls for this act. Defaults to 3."},
+			{"field": "wait_goal/success_criteria/blocked_criteria", "type": "string", "description": "Short local context sent to checkNext_ai without the main chat history."},
 		},
 		"actions": []map[string]any{
 			{"type": "move", "fields": "x, y", "description": "Move mouse pointer to screenshot pixel coordinates."},
@@ -336,14 +364,17 @@ func computerHelpResult(db *sql.DB) map[string]any {
 				"callback":          map[string]any{"tool": "sendmsg", "args": map[string]any{"target": "ai", "kind": "tool_result"}},
 			},
 			"act_wait_for_change_then_continue": map[string]any{
-				"operation":           "act",
-				"return_screenshot":   true,
-				"wait_after_ms":       1000,
-				"observe_retries":     12,
-				"observe_interval_ms": 1000,
-				"wait_until_changed":  true,
-				"actions":             []map[string]any{{"type": "click", "x": 200, "y": 300}},
-				"callback":            map[string]any{"tool": "sendmsg", "args": map[string]any{"target": "ai", "kind": "tool_result"}},
+				"operation":            "act",
+				"return_screenshot":    true,
+				"wait_after_ms":        1000,
+				"observe_retries":      12,
+				"observe_interval_ms":  1000,
+				"wait_until_changed":   true,
+				"check_next_ai":        true,
+				"ai_check_interval_ms": 10000,
+				"max_ai_checks":        3,
+				"actions":              []map[string]any{{"type": "click", "x": 200, "y": 300}},
+				"callback":             map[string]any{"tool": "sendmsg", "args": map[string]any{"target": "ai", "kind": "tool_result"}},
 			},
 		},
 		"safety": []string{
@@ -479,6 +510,13 @@ func observationOptionsFromArgs(args map[string]any, afterAction bool) ComputerO
 		ObserveIntervalMS: clampedIntArg(args, "observe_interval_ms", 1000, 0, maxComputerObserveIntervalMS),
 		WaitUntilChanged:  waitUntilChanged,
 		ChangeThreshold:   clampFloat(floatFromAny(args["change_threshold"], 0.02), 0.001, 1, 0.02),
+		CheckNextAI:       boolArg(args, "check_next_ai", false),
+		AIIntervalMS:      clampedIntArg(args, "ai_check_interval_ms", 10000, 1000, maxComputerWaitMS),
+		MaxAIChecks:       clampedIntArg(args, "max_ai_checks", 3, 0, 10),
+		WaitGoal:          strings.TrimSpace(stringArg(args, "wait_goal")),
+		SuccessCriteria:   strings.TrimSpace(stringArg(args, "success_criteria")),
+		BlockedCriteria:   strings.TrimSpace(stringArg(args, "blocked_criteria")),
+		LastAction:        strings.TrimSpace(stringArg(args, "last_action")),
 	}
 }
 
@@ -496,7 +534,7 @@ func clampedIntArg(args map[string]any, key string, def, min, max int) int {
 	return v
 }
 
-func observeComputer(ctx context.Context, screenshotOpts ComputerScreenshotOptions, observationOpts ComputerObservationOptions, baseline []uint8) (ComputerScreenshotResult, map[string]any, error) {
+func observeComputer(ctx context.Context, cfg Config, screenshotOpts ComputerScreenshotOptions, observationOpts ComputerObservationOptions, baseline []uint8, stepLogger *computerStepLogger) (ComputerScreenshotResult, map[string]any, error) {
 	if observationOpts.WaitAfterMS > 0 {
 		if err := sleepContext(ctx, time.Duration(observationOpts.WaitAfterMS)*time.Millisecond); err != nil {
 			return ComputerScreenshotResult{}, nil, err
@@ -508,6 +546,9 @@ func observeComputer(ctx context.Context, screenshotOpts ComputerScreenshotOptio
 	var lastSignature []uint8
 	var lastScore float64
 	changed := false
+	lastAIAt := time.Time{}
+	aiChecks := 0
+	aiState := ""
 	for attempt := 1; attempt <= observationOpts.ObserveRetries; attempt++ {
 		img, info, window, err := captureComputerScreenshotImage(ctx, screenshotOpts)
 		if err != nil {
@@ -521,10 +562,38 @@ func observeComputer(ctx context.Context, screenshotOpts ComputerScreenshotOptio
 		if observationOpts.WaitUntilChanged && len(baseline) > 0 {
 			lastScore = computerSignatureDifference(baseline, signature)
 			changed = lastScore >= observationOpts.ChangeThreshold
+			stepLogger.LogLocalCheck(attempt, "", lastScore, changed, false, map[string]any{
+				"threshold": observationOpts.ChangeThreshold,
+				"phase":     "post_action_observe",
+			})
 			if changed || attempt == observationOpts.ObserveRetries {
 				result, err := writeComputerScreenshotResult(img, info, window)
 				if err != nil {
 					return ComputerScreenshotResult{}, nil, err
+				}
+				stepLogger.LogLocalCheck(attempt, result.Path, lastScore, changed, true, map[string]any{
+					"threshold": observationOpts.ChangeThreshold,
+					"phase":     "final_observe",
+				})
+				if shouldRunCheckNextAI(observationOpts, aiChecks, lastAIAt) {
+					aiChecks++
+					lastAIAt = time.Now()
+					judge := runCheckNextAI(ctx, cfg, observationOpts, result.Path, attempt, stepLogger)
+					aiState = judge.State
+					if judge.State == "waiting" && attempt < observationOpts.ObserveRetries {
+						if observationOpts.ObserveIntervalMS > 0 {
+							if err := sleepContext(ctx, time.Duration(observationOpts.ObserveIntervalMS)*time.Millisecond); err != nil {
+								return ComputerScreenshotResult{}, nil, err
+							}
+						}
+						continue
+					} else if judge.State == "done" || judge.State == "blocked" || judge.State == "ready_for_next" || judge.State == "uncertain" {
+						observation := computerObservationResult(observationOpts, attempt, changed, lastScore)
+						observation["check_next_ai_state"] = judge.State
+						observation["check_next_ai_reason"] = judge.Reason
+						observation["check_next_ai_confidence"] = judge.Confidence
+						return result, observation, nil
+					}
 				}
 				return result, computerObservationResult(observationOpts, attempt, changed, lastScore), nil
 			}
@@ -549,7 +618,11 @@ func observeComputer(ctx context.Context, screenshotOpts ComputerScreenshotOptio
 		return ComputerScreenshotResult{}, nil, err
 	}
 	result.Signature = lastSignature
-	return result, computerObservationResult(observationOpts, observationOpts.ObserveRetries, changed, lastScore), nil
+	observation := computerObservationResult(observationOpts, observationOpts.ObserveRetries, changed, lastScore)
+	if aiState != "" {
+		observation["check_next_ai_state"] = aiState
+	}
+	return result, observation, nil
 }
 
 func computerObservationResult(opts ComputerObservationOptions, attempts int, changed bool, changeScore float64) map[string]any {
@@ -562,7 +635,29 @@ func computerObservationResult(opts ComputerObservationOptions, attempts int, ch
 		"changed":             changed,
 		"change_score":        changeScore,
 		"change_threshold":    opts.ChangeThreshold,
+		"check_next_ai":       opts.CheckNextAI,
 	}
+}
+
+func shouldRunCheckNextAI(opts ComputerObservationOptions, checks int, last time.Time) bool {
+	if !opts.CheckNextAI || opts.MaxAIChecks <= 0 || checks >= opts.MaxAIChecks {
+		return false
+	}
+	return last.IsZero() || time.Since(last) >= time.Duration(opts.AIIntervalMS)*time.Millisecond
+}
+
+func runCheckNextAI(ctx context.Context, cfg Config, opts ComputerObservationOptions, screenshotPath string, attempt int, logger *computerStepLogger) CheckNextAIResult {
+	result, raw, err := callCheckNextAI(ctx, cfg, opts.WaitGoal, opts.LastAction, opts.SuccessCriteria, opts.BlockedCriteria, screenshotPath)
+	extra := map[string]any{"attempt": attempt}
+	if raw != "" {
+		extra["raw"] = raw
+	}
+	if err != nil {
+		result = CheckNextAIResult{State: "uncertain", Reason: err.Error(), Confidence: 0}
+		extra["error"] = err.Error()
+	}
+	logger.LogAICheck(attempt, screenshotPath, result.State, result.Reason, result.Confidence, extra)
+	return result
 }
 
 func sleepContext(ctx context.Context, d time.Duration) error {

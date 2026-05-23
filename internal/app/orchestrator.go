@@ -171,6 +171,26 @@ func modelVisibleFunctionTools() []map[string]any {
 					"maximum":     1,
 					"description": "Normalized visual difference required by wait_until_changed. Defaults to 0.02.",
 				},
+				"check_next_ai": map[string]any{
+					"type":        "boolean",
+					"description": "Use a lightweight visual judge outside the main chat context during long waits.",
+				},
+				"ai_check_interval_ms": map[string]any{
+					"type":        "integer",
+					"minimum":     1000,
+					"maximum":     maxComputerWaitMS,
+					"description": "Minimum interval between checkNext_ai calls. Defaults to 10000.",
+				},
+				"max_ai_checks": map[string]any{
+					"type":        "integer",
+					"minimum":     0,
+					"maximum":     10,
+					"description": "Maximum checkNext_ai calls for this computer act. Defaults to 3.",
+				},
+				"wait_goal":        map[string]any{"type": "string"},
+				"success_criteria": map[string]any{"type": "string"},
+				"blocked_criteria": map[string]any{"type": "string"},
+				"last_action":      map[string]any{"type": "string"},
 				"actions": map[string]any{
 					"type":        "array",
 					"maxItems":    maxComputerActions,
@@ -416,7 +436,7 @@ func executeToolCall(ctx context.Context, db *sql.DB, cfg Config, call ToolCall,
 	case "selfie":
 		return executeSelfieTool(ctx, db, cfg, args)
 	case "computer":
-		return executeComputerTool(ctx, db, args)
+		return executeComputerTool(ctx, db, cfg, args, call.ID, messageID)
 	case "notify":
 		return executeNotifyTool(db, args)
 	case "schedule":
