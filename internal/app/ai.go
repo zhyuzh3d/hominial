@@ -91,6 +91,9 @@ func callResponsesWithContinuations(ctx context.Context, cfg Config, historyPath
 func continuationToAPIInput(c ToolContinuation) map[string]any {
 	var b strings.Builder
 	b.WriteString("Tool callback result for this same turn. Continue the conversation using this result. Do not repeat the raw JSON unless it is useful to the user.\n")
+	if c.Informational {
+		b.WriteString("This is an informational tool guide, not a completed user-facing action. Use it to continue the task; do not fetch the same guide again unless the previous guide was incomplete.\n")
+	}
 	if strings.TrimSpace(c.Text) != "" {
 		b.WriteString("\nText:\n")
 		b.WriteString(c.Text)

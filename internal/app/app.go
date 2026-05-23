@@ -24,7 +24,7 @@ import (
 	"gioui.org/widget/material"
 )
 
-const appVersion = "0.3.1"
+const appVersion = "0.3.2"
 
 type ChatApp struct {
 	win *gioapp.Window
@@ -466,8 +466,20 @@ func (a *ChatApp) send() {
 }
 
 func (a *ChatApp) runContinuations(ctx context.Context, cfg Config, historyPath string, peCfg PEConfig, continuations []ToolContinuation) {
-	const maxContinuationDepth = 3
-	for depth := 0; depth < maxContinuationDepth && len(continuations) > 0; depth++ {
+	const maxContinuationActionDepth = 30
+	const maxContinuationTotalDepth = 60
+	actionDepth := 0
+	computerHelpSeen := false
+	for totalDepth := 0; totalDepth < maxContinuationTotalDepth && actionDepth < maxContinuationActionDepth && len(continuations) > 0; totalDepth++ {
+		if continuationsContainComputerHelp(continuations) {
+			computerHelpSeen = true
+		}
+		if !continuationsAreInformational(continuations) {
+			actionDepth++
+		}
+		if computerHelpSeen {
+			continuations = addComputerHelpReminder(continuations)
+		}
 		a.setStatus("Continuing with tool results...")
 		result, err := callResponsesWithContinuations(ctx, cfg, historyPath, peCfg, continuations)
 		if err != nil {
@@ -510,6 +522,42 @@ func (a *ChatApp) runContinuations(ctx context.Context, cfg Config, historyPath 
 	if len(continuations) > 0 {
 		a.setStatus("Continuation stopped after safety limit")
 	}
+}
+
+func continuationsAreInformational(continuations []ToolContinuation) bool {
+	if len(continuations) == 0 {
+		return false
+	}
+	for _, continuation := range continuations {
+		if !continuation.Informational {
+			return false
+		}
+	}
+	return true
+}
+
+func continuationsContainComputerHelp(continuations []ToolContinuation) bool {
+	for _, continuation := range continuations {
+		if isComputerHelpPayload(continuation.Payload) {
+			return true
+		}
+	}
+	return false
+}
+
+func addComputerHelpReminder(continuations []ToolContinuation) []ToolContinuation {
+	if len(continuations) == 0 {
+		return continuations
+	}
+	out := make([]ToolContinuation, len(continuations))
+	copy(out, continuations)
+	const reminder = "Computer API guide has already been fetched in this turn. Do not call computer help again just to use observe or act; continue with observe/act based on the current task and latest screenshot.\n"
+	for i := range out {
+		if !strings.Contains(out[i].Text, "Computer API guide has already been fetched") {
+			out[i].Text = reminder + out[i].Text
+		}
+	}
+	return out
 }
 
 func (a *ChatApp) runSchedulerLoop() {

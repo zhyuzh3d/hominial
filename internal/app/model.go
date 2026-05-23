@@ -74,10 +74,11 @@ type ToolCallback struct {
 }
 
 type ToolContinuation struct {
-	SourceCallID string
-	Text         string
-	Images       []string
-	Payload      map[string]any
+	SourceCallID  string
+	Text          string
+	Images        []string
+	Payload       map[string]any
+	Informational bool
 }
 
 type OrchestratorResult struct {

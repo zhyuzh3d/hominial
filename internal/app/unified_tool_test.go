@@ -174,6 +174,25 @@ func TestComputerToolHelpPermissionsAndContinuationImage(t *testing.T) {
 	if help["enabled"].(bool) {
 		t.Fatal("computer use should default to disabled")
 	}
+	helpResult, _, err := executeSendMsgTool(map[string]any{
+		"target":  "ai",
+		"kind":    "tool_result",
+		"payload": help,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	helpContinuation, ok := continuationFromToolResult(ToolCall{ID: "call_help", Name: "sendmsg"}, helpResult)
+	if !ok || !helpContinuation.Informational {
+		t.Fatalf("expected informational computer help continuation, got %#v", helpContinuation)
+	}
+	if !continuationsAreInformational([]ToolContinuation{helpContinuation}) {
+		t.Fatalf("expected help continuation to be non-billable")
+	}
+	withReminder := addComputerHelpReminder([]ToolContinuation{{Text: "next screenshot result"}})
+	if len(withReminder) != 1 || !strings.Contains(withReminder[0].Text, "Computer API guide has already been fetched") {
+		t.Fatalf("expected computer help reminder, got %#v", withReminder)
+	}
 	if _, _, err := executeComputerTool(context.Background(), db, map[string]any{"operation": "observe"}); err == nil {
 		t.Fatal("expected observe to be denied while disabled")
 	}

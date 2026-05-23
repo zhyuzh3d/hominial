@@ -1033,11 +1033,27 @@ func continuationFromToolResult(call ToolCall, result map[string]any) (ToolConti
 		return ToolContinuation{}, false
 	}
 	return ToolContinuation{
-		SourceCallID: call.ID,
-		Text:         text,
-		Images:       images,
-		Payload:      payload,
+		SourceCallID:  call.ID,
+		Text:          text,
+		Images:        images,
+		Payload:       payload,
+		Informational: isInformationalToolContinuation(payload),
 	}, true
+}
+
+func isInformationalToolContinuation(payload map[string]any) bool {
+	return isComputerHelpPayload(payload)
+}
+
+func isComputerHelpPayload(payload map[string]any) bool {
+	if payload == nil {
+		return false
+	}
+	tool, _ := payload["tool"].(string)
+	if tool == "computer" && payload["operations"] != nil && payload["actions"] != nil {
+		return true
+	}
+	return false
 }
 
 func intIDFromAny(v any) int {
