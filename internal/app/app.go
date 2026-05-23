@@ -24,7 +24,7 @@ import (
 	"gioui.org/widget/material"
 )
 
-const appVersion = "0.3.2"
+const appVersion = "0.3.3"
 
 type ChatApp struct {
 	win *gioapp.Window
@@ -468,9 +468,12 @@ func (a *ChatApp) send() {
 func (a *ChatApp) runContinuations(ctx context.Context, cfg Config, historyPath string, peCfg PEConfig, continuations []ToolContinuation) {
 	const maxContinuationActionDepth = 30
 	const maxContinuationTotalDepth = 60
+	const maxContinuationWallClock = 10 * time.Minute
+	ctx, cancel := context.WithTimeout(ctx, maxContinuationWallClock)
+	defer cancel()
 	actionDepth := 0
 	computerHelpSeen := false
-	for totalDepth := 0; totalDepth < maxContinuationTotalDepth && actionDepth < maxContinuationActionDepth && len(continuations) > 0; totalDepth++ {
+	for totalDepth := 0; totalDepth < maxContinuationTotalDepth && actionDepth < maxContinuationActionDepth && len(continuations) > 0 && ctx.Err() == nil; totalDepth++ {
 		if continuationsContainComputerHelp(continuations) {
 			computerHelpSeen = true
 		}
@@ -518,6 +521,10 @@ func (a *ChatApp) runContinuations(ctx context.Context, cfg Config, historyPath 
 		a.mu.Unlock()
 		a.win.Invalidate()
 		continuations = orch.Continuations
+	}
+	if ctx.Err() != nil {
+		a.setStatus("Continuation stopped after time limit")
+		return
 	}
 	if len(continuations) > 0 {
 		a.setStatus("Continuation stopped after safety limit")

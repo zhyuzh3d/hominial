@@ -143,6 +143,34 @@ func modelVisibleFunctionTools() []map[string]any {
 					"type":        "boolean",
 					"description": "For operation=act, capture and return a screenshot after the action sequence. Defaults to true.",
 				},
+				"wait_after_ms": map[string]any{
+					"type":        "integer",
+					"minimum":     0,
+					"maximum":     maxComputerWaitMS,
+					"description": "For operation=observe or act+return_screenshot, wait before the first screenshot. Defaults to 0 for observe and 800 for act.",
+				},
+				"observe_retries": map[string]any{
+					"type":        "integer",
+					"minimum":     1,
+					"maximum":     maxComputerObserveRetries,
+					"description": "Maximum screenshot attempts before returning. Defaults to 1, or 10 when wait_until_changed=true.",
+				},
+				"observe_interval_ms": map[string]any{
+					"type":        "integer",
+					"minimum":     0,
+					"maximum":     maxComputerObserveIntervalMS,
+					"description": "Milliseconds between screenshot attempts while waiting for a changed screen.",
+				},
+				"wait_until_changed": map[string]any{
+					"type":        "boolean",
+					"description": "When true, wait for visual change before returning the screenshot. For act, baseline is captured before actions run.",
+				},
+				"change_threshold": map[string]any{
+					"type":        "number",
+					"minimum":     0.001,
+					"maximum":     1,
+					"description": "Normalized visual difference required by wait_until_changed. Defaults to 0.02.",
+				},
 				"actions": map[string]any{
 					"type":        "array",
 					"maxItems":    maxComputerActions,
@@ -1442,6 +1470,34 @@ func intFromAny(v any, def int) int {
 		}
 	}
 	return def
+}
+
+func floatFromAny(v any, def float64) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case int:
+		return float64(n)
+	case json.Number:
+		f, err := n.Float64()
+		if err == nil {
+			return f
+		}
+	}
+	return def
+}
+
+func clampFloat(v, min, max, def float64) float64 {
+	if v == 0 {
+		return def
+	}
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
 }
 
 func jsonObjectString(v any) string {

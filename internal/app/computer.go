@@ -14,6 +14,9 @@ import (
 )
 
 const maxComputerActions = 10
+const maxComputerObserveRetries = 30
+const maxComputerWaitMS = 60000
+const maxComputerObserveIntervalMS = 10000
 
 type ComputerBackend interface {
 	Name() string
@@ -48,6 +51,21 @@ type ComputerScreenshotOptions struct {
 	WindowTitleContains string
 	CropToWindow        bool
 	ActivateWindow      bool
+}
+
+type ComputerObservationOptions struct {
+	WaitAfterMS       int
+	ObserveRetries    int
+	ObserveIntervalMS int
+	WaitUntilChanged  bool
+	ChangeThreshold   float64
+}
+
+type ComputerScreenshotResult struct {
+	Path      string
+	Info      ComputerScreenInfo
+	Window    *ComputerWindowInfo
+	Signature []uint8
 }
 
 type ComputerWindowInfo struct {
@@ -91,23 +109,24 @@ func executeComputerTool(ctx context.Context, db *sql.DB, args map[string]any) (
 
 	switch operation {
 	case "observe", "screenshot":
-		path, info, window, err := captureComputerScreenshot(ctx, screenshotOptionsFromArgs(args))
+		result, observation, err := observeComputer(ctx, screenshotOptionsFromArgs(args), observationOptionsFromArgs(args, false), nil)
 		if err != nil {
 			result := computerFailureResult("observe", err)
 			return result, computerFailureMessage(result), nil
 		}
-		result := map[string]any{
+		payload := map[string]any{
 			"ok":              true,
 			"operation":       "observe",
 			"backend":         currentComputerBackend.Name(),
-			"screen":          info,
-			"screenshot_path": path,
-			"images":          []string{path},
+			"screen":          result.Info,
+			"screenshot_path": result.Path,
+			"images":          []string{result.Path},
+			"observation":     observation,
 		}
-		if window != nil {
-			result["window"] = *window
+		if result.Window != nil {
+			payload["window"] = *result.Window
 		}
-		return result, computerResultMessage(result), nil
+		return payload, computerResultMessage(payload), nil
 	case "act":
 		actions, err := computerActionsFromAny(args["actions"])
 		if err != nil {
@@ -118,6 +137,20 @@ func executeComputerTool(ctx context.Context, db *sql.DB, args map[string]any) (
 		}
 		if len(actions) > maxComputerActions {
 			return nil, nil, fmt.Errorf("too many computer actions: max %d", maxComputerActions)
+		}
+		returnScreenshot := boolArg(args, "return_screenshot", true)
+		screenshotOpts := screenshotOptionsFromArgs(args)
+		observationOpts := observationOptionsFromArgs(args, true)
+		var baseline []uint8
+		if returnScreenshot && observationOpts.WaitUntilChanged {
+			before, _, _, err := captureComputerScreenshotImage(ctx, screenshotOpts)
+			if err != nil {
+				result := computerFailureResult("act", err)
+				result["executed"] = 0
+				result["stage"] = "pre_action_observe"
+				return result, computerFailureMessage(result), nil
+			}
+			baseline = computerImageSignature(before)
 		}
 		if err := currentComputerBackend.Execute(ctx, actions); err != nil {
 			result := computerFailureResult("act", err)
@@ -130,19 +163,20 @@ func executeComputerTool(ctx context.Context, db *sql.DB, args map[string]any) (
 			"backend":   currentComputerBackend.Name(),
 			"executed":  len(actions),
 		}
-		if boolArg(args, "return_screenshot", true) {
-			path, info, window, err := captureComputerScreenshot(ctx, screenshotOptionsFromArgs(args))
+		if returnScreenshot {
+			screenshot, observation, err := observeComputer(ctx, screenshotOpts, observationOpts, baseline)
 			if err != nil {
 				result["ok"] = false
 				result["screenshot_error"] = err.Error()
 				result["diagnosis"] = computerPermissionDiagnosis()
 				return result, computerFailureMessage(result), nil
 			}
-			result["screen"] = info
-			result["screenshot_path"] = path
-			result["images"] = []string{path}
-			if window != nil {
-				result["window"] = *window
+			result["screen"] = screenshot.Info
+			result["screenshot_path"] = screenshot.Path
+			result["images"] = []string{screenshot.Path}
+			result["observation"] = observation
+			if screenshot.Window != nil {
+				result["window"] = *screenshot.Window
 			}
 		}
 		return result, computerResultMessage(result), nil
@@ -173,6 +207,10 @@ func computerResultMessage(result map[string]any) *Message {
 	}
 	if path, _ := result["screenshot_path"].(string); path != "" {
 		fmt.Fprintf(&b, "- screenshot_path: %s\n", path)
+	}
+	if observation, exists := result["observation"]; exists {
+		raw, _ := json.Marshal(observation)
+		fmt.Fprintf(&b, "- observation: %s\n", string(raw))
 	}
 	return &Message{
 		Role:      "assistant",
@@ -248,7 +286,7 @@ func computerHelpResult(db *sql.DB) map[string]any {
 		"operations": []map[string]any{
 			{"operation": "help", "description": "Return this API guide. This is safe and available even when computer use is disabled."},
 			{"operation": "observe", "description": "Capture the desktop screenshot. Pass crop_to_window=true with target_app/window_title_contains to activate and crop a specific app window without changing the default fullscreen behavior. Use callback sendmsg target=ai to continue reasoning from the screenshot."},
-			{"operation": "act", "description": "Execute up to 10 primitive mouse/keyboard actions. Set return_screenshot=true to observe the result."},
+			{"operation": "act", "description": "Execute up to 10 primitive mouse/keyboard actions. Set return_screenshot=true to observe the result. For slow UI changes, use wait_after_ms plus observe_retries/observe_interval_ms or wait_until_changed."},
 		},
 		"observe_fields": []map[string]any{
 			{"field": "crop_to_window", "type": "boolean", "description": "When true, locate a matching application window and capture only that window region. Defaults to false."},
@@ -256,6 +294,13 @@ func computerHelpResult(db *sql.DB) map[string]any {
 			{"field": "target_app", "type": "string", "description": "Application/process name to match, e.g. Google Chrome or Chrome."},
 			{"field": "window_title_contains", "type": "string", "description": "Case-insensitive substring of the window title, e.g. WPS Office for Mac."},
 			{"field": "x/y/width/height", "type": "integer", "description": "Optional manual screenshot region. Existing fullscreen observe remains unchanged when omitted."},
+		},
+		"loop_fields": []map[string]any{
+			{"field": "wait_after_ms", "type": "integer", "description": "For observe or act+return_screenshot, wait this many milliseconds before the first screenshot. Defaults to 0 for observe and 800 for act."},
+			{"field": "observe_retries", "type": "integer", "description": "Maximum screenshot attempts before returning. Defaults to 1, or 10 when wait_until_changed=true. Max 30."},
+			{"field": "observe_interval_ms", "type": "integer", "description": "Milliseconds between screenshot attempts while waiting for change. Defaults to 1000. Max 10000."},
+			{"field": "wait_until_changed", "type": "boolean", "description": "When true, compare screenshots and keep waiting until the image changes enough or retries are exhausted. For act, the baseline is captured before actions run."},
+			{"field": "change_threshold", "type": "number", "description": "Normalized visual difference needed for wait_until_changed. Defaults to 0.02."},
 		},
 		"actions": []map[string]any{
 			{"type": "move", "fields": "x, y", "description": "Move mouse pointer to screenshot pixel coordinates."},
@@ -286,8 +331,19 @@ func computerHelpResult(db *sql.DB) map[string]any {
 			"act_then_continue": map[string]any{
 				"operation":         "act",
 				"return_screenshot": true,
+				"wait_after_ms":     800,
 				"actions":           []map[string]any{{"type": "click", "x": 200, "y": 300}, {"type": "type", "text": "hello"}, {"type": "key", "key": "enter"}},
 				"callback":          map[string]any{"tool": "sendmsg", "args": map[string]any{"target": "ai", "kind": "tool_result"}},
+			},
+			"act_wait_for_change_then_continue": map[string]any{
+				"operation":           "act",
+				"return_screenshot":   true,
+				"wait_after_ms":       1000,
+				"observe_retries":     12,
+				"observe_interval_ms": 1000,
+				"wait_until_changed":  true,
+				"actions":             []map[string]any{{"type": "click", "x": 200, "y": 300}},
+				"callback":            map[string]any{"tool": "sendmsg", "args": map[string]any{"target": "ai", "kind": "tool_result"}},
 			},
 		},
 		"safety": []string{
@@ -311,29 +367,69 @@ func computerUseEnabled(db *sql.DB) bool {
 }
 
 func captureComputerScreenshot(ctx context.Context, opts ComputerScreenshotOptions) (string, ComputerScreenInfo, *ComputerWindowInfo, error) {
+	result, err := captureComputerScreenshotResult(ctx, opts)
+	if err != nil {
+		return "", ComputerScreenInfo{}, nil, err
+	}
+	return result.Path, result.Info, result.Window, nil
+}
+
+func captureComputerScreenshotResult(ctx context.Context, opts ComputerScreenshotOptions) (ComputerScreenshotResult, error) {
+	img, info, window, err := captureComputerScreenshotImage(ctx, opts)
+	if err != nil {
+		return ComputerScreenshotResult{}, err
+	}
+	return writeComputerScreenshotResult(img, info, window)
+}
+
+func writeComputerScreenshotResult(img image.Image, info ComputerScreenInfo, window *ComputerWindowInfo) (ComputerScreenshotResult, error) {
+	if img == nil {
+		return ComputerScreenshotResult{}, errors.New("computer backend returned nil screenshot")
+	}
+	outPath, err := appOutputPath("screenshots", "screen_"+time.Now().Format("20060102_150405_000000000")+".png")
+	if err != nil {
+		return ComputerScreenshotResult{}, err
+	}
+	f, err := os.Create(outPath)
+	if err != nil {
+		return ComputerScreenshotResult{}, err
+	}
+	defer f.Close()
+	if err := png.Encode(f, img); err != nil {
+		return ComputerScreenshotResult{}, err
+	}
+	return ComputerScreenshotResult{
+		Path:      outPath,
+		Info:      info,
+		Window:    window,
+		Signature: computerImageSignature(img),
+	}, nil
+}
+
+func captureComputerScreenshotImage(ctx context.Context, opts ComputerScreenshotOptions) (image.Image, ComputerScreenInfo, *ComputerWindowInfo, error) {
 	var window *ComputerWindowInfo
 	if opts.CropToWindow {
 		locator, ok := currentComputerBackend.(ComputerWindowLocator)
 		if !ok {
-			return "", ComputerScreenInfo{}, nil, errors.New("computer backend does not support window lookup")
+			return nil, ComputerScreenInfo{}, nil, errors.New("computer backend does not support window lookup")
 		}
 		located, err := locator.LocateWindow(ctx, opts)
 		if err != nil {
-			return "", ComputerScreenInfo{}, nil, err
+			return nil, ComputerScreenInfo{}, nil, err
 		}
 		window = &located
 		if opts.ActivateWindow {
 			activator, ok := currentComputerBackend.(ComputerWindowActivator)
 			if !ok {
-				return "", ComputerScreenInfo{}, nil, errors.New("computer backend does not support window activation")
+				return nil, ComputerScreenInfo{}, nil, errors.New("computer backend does not support window activation")
 			}
 			if err := activator.ActivateWindow(ctx, opts, located); err != nil {
-				return "", ComputerScreenInfo{}, nil, err
+				return nil, ComputerScreenInfo{}, nil, err
 			}
 			time.Sleep(350 * time.Millisecond)
 			relocated, err := locator.LocateWindow(ctx, opts)
 			if err != nil {
-				return "", ComputerScreenInfo{}, nil, err
+				return nil, ComputerScreenInfo{}, nil, err
 			}
 			window = &relocated
 			located = relocated
@@ -346,24 +442,12 @@ func captureComputerScreenshot(ctx context.Context, opts ComputerScreenshotOptio
 
 	img, info, err := currentComputerBackend.Screenshot(ctx, opts)
 	if err != nil {
-		return "", ComputerScreenInfo{}, nil, err
+		return nil, ComputerScreenInfo{}, nil, err
 	}
 	if img == nil {
-		return "", ComputerScreenInfo{}, nil, errors.New("computer backend returned nil screenshot")
+		return nil, ComputerScreenInfo{}, nil, errors.New("computer backend returned nil screenshot")
 	}
-	outPath, err := appOutputPath("screenshots", "screen_"+time.Now().Format("20060102_150405_000000000")+".png")
-	if err != nil {
-		return "", ComputerScreenInfo{}, nil, err
-	}
-	f, err := os.Create(outPath)
-	if err != nil {
-		return "", ComputerScreenInfo{}, nil, err
-	}
-	defer f.Close()
-	if err := png.Encode(f, img); err != nil {
-		return "", ComputerScreenInfo{}, nil, err
-	}
-	return outPath, info, window, nil
+	return img, info, window, nil
 }
 
 func screenshotOptionsFromArgs(args map[string]any) ComputerScreenshotOptions {
@@ -377,6 +461,161 @@ func screenshotOptionsFromArgs(args map[string]any) ComputerScreenshotOptions {
 		CropToWindow:        boolArg(args, "crop_to_window", false),
 		ActivateWindow:      boolArg(args, "activate_window", true),
 	}
+}
+
+func observationOptionsFromArgs(args map[string]any, afterAction bool) ComputerObservationOptions {
+	waitDefault := 0
+	if afterAction {
+		waitDefault = 800
+	}
+	waitUntilChanged := boolArg(args, "wait_until_changed", false)
+	retriesDefault := 1
+	if waitUntilChanged {
+		retriesDefault = 10
+	}
+	return ComputerObservationOptions{
+		WaitAfterMS:       clampedIntArg(args, "wait_after_ms", waitDefault, 0, maxComputerWaitMS),
+		ObserveRetries:    clampedIntArg(args, "observe_retries", retriesDefault, 1, maxComputerObserveRetries),
+		ObserveIntervalMS: clampedIntArg(args, "observe_interval_ms", 1000, 0, maxComputerObserveIntervalMS),
+		WaitUntilChanged:  waitUntilChanged,
+		ChangeThreshold:   clampFloat(floatFromAny(args["change_threshold"], 0.02), 0.001, 1, 0.02),
+	}
+}
+
+func clampedIntArg(args map[string]any, key string, def, min, max int) int {
+	v := def
+	if hasArg(args, key) {
+		v = intFromAny(args[key], def)
+	}
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
+func observeComputer(ctx context.Context, screenshotOpts ComputerScreenshotOptions, observationOpts ComputerObservationOptions, baseline []uint8) (ComputerScreenshotResult, map[string]any, error) {
+	if observationOpts.WaitAfterMS > 0 {
+		if err := sleepContext(ctx, time.Duration(observationOpts.WaitAfterMS)*time.Millisecond); err != nil {
+			return ComputerScreenshotResult{}, nil, err
+		}
+	}
+	var lastImg image.Image
+	var lastInfo ComputerScreenInfo
+	var lastWindow *ComputerWindowInfo
+	var lastSignature []uint8
+	var lastScore float64
+	changed := false
+	for attempt := 1; attempt <= observationOpts.ObserveRetries; attempt++ {
+		img, info, window, err := captureComputerScreenshotImage(ctx, screenshotOpts)
+		if err != nil {
+			return ComputerScreenshotResult{}, nil, err
+		}
+		signature := computerImageSignature(img)
+		lastImg = img
+		lastInfo = info
+		lastWindow = window
+		lastSignature = signature
+		if observationOpts.WaitUntilChanged && len(baseline) > 0 {
+			lastScore = computerSignatureDifference(baseline, signature)
+			changed = lastScore >= observationOpts.ChangeThreshold
+			if changed || attempt == observationOpts.ObserveRetries {
+				result, err := writeComputerScreenshotResult(img, info, window)
+				if err != nil {
+					return ComputerScreenshotResult{}, nil, err
+				}
+				return result, computerObservationResult(observationOpts, attempt, changed, lastScore), nil
+			}
+		} else {
+			result, err := writeComputerScreenshotResult(img, info, window)
+			if err != nil {
+				return ComputerScreenshotResult{}, nil, err
+			}
+			return result, computerObservationResult(observationOpts, attempt, false, 0), nil
+		}
+		if observationOpts.ObserveIntervalMS > 0 {
+			if err := sleepContext(ctx, time.Duration(observationOpts.ObserveIntervalMS)*time.Millisecond); err != nil {
+				return ComputerScreenshotResult{}, nil, err
+			}
+		}
+	}
+	if lastImg == nil {
+		return ComputerScreenshotResult{}, nil, errors.New("computer observe produced no screenshot")
+	}
+	result, err := writeComputerScreenshotResult(lastImg, lastInfo, lastWindow)
+	if err != nil {
+		return ComputerScreenshotResult{}, nil, err
+	}
+	result.Signature = lastSignature
+	return result, computerObservationResult(observationOpts, observationOpts.ObserveRetries, changed, lastScore), nil
+}
+
+func computerObservationResult(opts ComputerObservationOptions, attempts int, changed bool, changeScore float64) map[string]any {
+	return map[string]any{
+		"attempts":            attempts,
+		"wait_after_ms":       opts.WaitAfterMS,
+		"observe_retries":     opts.ObserveRetries,
+		"observe_interval_ms": opts.ObserveIntervalMS,
+		"wait_until_changed":  opts.WaitUntilChanged,
+		"changed":             changed,
+		"change_score":        changeScore,
+		"change_threshold":    opts.ChangeThreshold,
+	}
+}
+
+func sleepContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func computerImageSignature(img image.Image) []uint8 {
+	const cols = 32
+	const rows = 18
+	bounds := img.Bounds()
+	if bounds.Empty() {
+		return nil
+	}
+	out := make([]uint8, 0, cols*rows)
+	for row := 0; row < rows; row++ {
+		y := bounds.Min.Y + (row*bounds.Dy()+bounds.Dy()/2)/rows
+		for col := 0; col < cols; col++ {
+			x := bounds.Min.X + (col*bounds.Dx()+bounds.Dx()/2)/cols
+			r, g, b, _ := img.At(x, y).RGBA()
+			gray := (299*uint32(r>>8) + 587*uint32(g>>8) + 114*uint32(b>>8)) / 1000
+			out = append(out, uint8(gray))
+		}
+	}
+	return out
+}
+
+func computerSignatureDifference(a, b []uint8) float64 {
+	if len(a) == 0 || len(b) == 0 {
+		return 0
+	}
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	var total int
+	for i := 0; i < n; i++ {
+		diff := int(a[i]) - int(b[i])
+		if diff < 0 {
+			diff = -diff
+		}
+		total += diff
+	}
+	return float64(total) / float64(n*255)
 }
 
 func computerActionsFromAny(v any) ([]ComputerAction, error) {

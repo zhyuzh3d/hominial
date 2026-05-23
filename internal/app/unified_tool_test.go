@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"image"
+	"image/color"
 	"os"
 	"path/filepath"
 	"strings"
@@ -261,6 +262,33 @@ func TestComputerToolHelpPermissionsAndContinuationImage(t *testing.T) {
 		t.Fatalf("expected user-visible window result message, got %#v", msg)
 	}
 
+	changingBackend := &fakeChangingComputerBackend{}
+	currentComputerBackend = changingBackend
+	acted, _, err := executeComputerTool(context.Background(), db, map[string]any{
+		"operation":           "act",
+		"actions":             []any{map[string]any{"type": "move", "x": float64(1), "y": float64(1)}},
+		"return_screenshot":   true,
+		"wait_after_ms":       float64(0),
+		"observe_retries":     float64(2),
+		"observe_interval_ms": float64(0),
+		"wait_until_changed":  true,
+	})
+	if err != nil {
+		t.Fatalf("computer act wait loop: %v", err)
+	}
+	actPath, _ := acted["screenshot_path"].(string)
+	if actPath == "" {
+		t.Fatalf("missing act screenshot path: %#v", acted)
+	}
+	defer os.Remove(actPath)
+	observation, _ := acted["observation"].(map[string]any)
+	if observation["changed"] != true || observation["attempts"] != 1 {
+		t.Fatalf("expected changed observation on first post-action screenshot, got %#v", observation)
+	}
+	if changingBackend.screenshotCount != 2 || changingBackend.executed != 1 {
+		t.Fatalf("expected baseline plus post-action screenshot, got screenshots=%d executed=%d", changingBackend.screenshotCount, changingBackend.executed)
+	}
+
 	currentComputerBackend = failingComputerBackend{}
 	failed, _, err := executeComputerTool(context.Background(), db, map[string]any{"operation": "observe"})
 	if err != nil {
@@ -284,6 +312,41 @@ func (fakeComputerBackend) Screenshot(context.Context, ComputerScreenshotOptions
 }
 
 func (fakeComputerBackend) Execute(context.Context, []ComputerAction) error { return nil }
+
+type fakeChangingComputerBackend struct {
+	executed        int
+	screenshotCount int
+}
+
+func (fakeChangingComputerBackend) Name() string { return "fake-changing" }
+
+func (fakeChangingComputerBackend) ScreenInfo() (ComputerScreenInfo, error) {
+	return ComputerScreenInfo{Width: 12, Height: 8, Scale: 1}, nil
+}
+
+func (b *fakeChangingComputerBackend) Screenshot(context.Context, ComputerScreenshotOptions) (image.Image, ComputerScreenInfo, error) {
+	b.screenshotCount++
+	c := color.Black
+	if b.executed > 0 {
+		c = color.White
+	}
+	return solidTestImage(12, 8, c), ComputerScreenInfo{Width: 12, Height: 8, Scale: 1}, nil
+}
+
+func (b *fakeChangingComputerBackend) Execute(context.Context, []ComputerAction) error {
+	b.executed++
+	return nil
+}
+
+func solidTestImage(width, height int, c color.Color) image.Image {
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			img.Set(x, y, c)
+		}
+	}
+	return img
+}
 
 type fakeWindowComputerBackend struct {
 	activated      int
